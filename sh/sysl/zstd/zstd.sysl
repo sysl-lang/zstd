@@ -1,0 +1,797 @@
+// Zstandard for sysl — the compressor that made the speed/ratio question stop being one.
+//
+// **zstd is what you reach for when the answer used to be gzip.** At its default level it is several
+// times faster than zlib and compresses better; at level 1 it is faster than anything that
+// compresses at all; and at 19 it is in brotli's range. One library, one format, and a level dial
+// running from -131072 to 22 across the whole of that. `sh.sysl.miniz` is the package for deflate
+// and gzip, and `sh.sysl.brotli` the one for `Content-Encoding: br`; this is the one for storage, for
+// logs, for a build cache and for anything where the two ends are yours.
+//
+// ## Two shapes, and which to reach for
+//
+// **`compress` and `decompress` own their answers**, so nothing has to be sized:
+//
+//     val small = compress(page)?              // a Buf[u8]
+//     val back  = decompress(small.view(), 1 << 20)?
+//
+// **`Encoder` and `Decoder` take a chunk at a time into a slice the caller owns**, which is what a
+// stream being written as it is produced wants. They are deliberately the same shape `brotli`'s and
+// `miniz`'s are — `push(src, dst, …)` answering a `Progress` — so a program choosing an encoding at
+// run time writes the branches the same way.
+//
+// ## The limit on `decompress` is not optional, and that is the point
+//
+// **A zstd frame is entitled to say nothing about how large it becomes**, and one written by a
+// streaming encoder that was not told the length says exactly that. Even where the header *does*
+// carry a content size, that number is the frame's claim rather than a fact: a frame that came off
+// somebody else's machine can say what it likes. So a server decompressing a request body must
+// bound it, and a bound that is easy to forget is one that gets forgotten. `decompress` takes the
+// limit as an argument and there is no form that omits it; `decompress_into` is bounded by the slice
+// it is given. This is `sh.sysl.brotli`'s rule and it is here for the same reason.
+//
+// **`frame_content_size` is how a caller finds out what the frame claims** before deciding what
+// limit to pass, and it answers `Unknown` and `NotAFrame` as values rather than folding either into
+// a number.
+//
+// ## Why the allocator is not redirected, though zstd offers to
+//
+// `ZSTD_createCCtx_advanced` takes an allocator triple, and several bindings in this org take that
+// route to put a library's state in storage the program owns. **It is the wrong trade here**,
+// measured rather than assumed: every compression is **2 allocations and 2 frees**, and what varies
+// is how much they ask for — 1.30 MB compressing a megabyte at the default level, 18.1 MB at level
+// 19, and, streaming with the size not pledged, 3.66 MB at level 3 rising to **874 MB** at level 22.
+// There is no figure a caller could size an arena with before choosing the level, the window and
+// whether to pledge. What the library does supply is the answer *afterwards*, so
+// `Encoder.footprint()` reports the real working set rather than an estimate. Hence
+// `requires { heap = true }` and a `Drop` on each context.
+
+module sh.sysl.zstd
+
+import sh.sysl.zstd.c
+import sysl.text.from_cstring
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.buf.{Buf, buf, buf_with_capacity}
+
+// Why a compress or a decompress did not finish.
+enum Error
+    // The output slice cannot hold the answer, and **`needed` is a size that will actually work**.
+    //
+    // The two directions differ and the reason is zstd's rather than this package's. Decompressing,
+    // it is the exact figure. Compressing, it is `compress_bound(src.len)` — because zstd's one-shot
+    // needs headroom past what it produces, so the size of the answer is not a size a caller could
+    // retry at, and handing one back would be handing back a figure that fails again in a loop.
+    // `compress_into` has the measurement.
+    Short(needed: usize)
+
+    // Decompressing: the answer passed the limit it was given. `limit` is the number that was
+    // passed, not how large the answer would have been — finding that out is exactly what the limit
+    // exists to refuse to do.
+    TooLarge(limit: usize)
+
+    // The input ended in the middle of a frame. More bytes would have continued it, so this is what
+    // a partial download looks like rather than a corrupt one. It is also what a frame whose
+    // pledged content size disagrees with its content answers, which is the same mistake seen from
+    // the other end.
+    Truncated
+
+    // The bytes are not a valid zstd frame, or a checksum disagreed with the content. `code` is
+    // zstd's own `ZSTD_ErrorCode` and `why` its own sentence — worth logging, since zstd
+    // distinguishes an unrecognised prefix from a corrupted block from a wrong dictionary.
+    Corrupt(code: int, why: string)
+
+    // The library refused to allocate. On a host this means the process is out of memory; at level
+    // 19 with a large window a single context asks for over a hundred megabytes, so it is reachable
+    // without anything being wrong.
+    NoMemory
+
+    // A parameter outside what this build of zstd accepts. `what` names it and `low`/`high` are the
+    // inclusive range the library itself reported — **which is why a request for workers on a
+    // single-threaded build lands here**, with a range of 0 to 0.
+    OutOfRange(what: string, low: int, high: int)
+end Error
+
+// What a caller puts in a log. `Corrupt` carries zstd's own sentence, which is the half worth having
+// — it distinguishes a bad prefix from a corrupted block from a wrong dictionary.
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec)
+        val s = self match
+            Short(needed) -> f"the destination is too small; $needed%d bytes are wanted"
+            TooLarge(limit) -> f"the answer passed the $limit%d-byte limit it was given"
+            Truncated -> "the input ended in the middle of a frame"
+            Corrupt(code, why) -> f"zstd error $code%d: $why"
+            NoMemory -> "zstd could not allocate its context"
+            OutOfRange(what, low, high) -> f"$what is outside $low%d..$high%d on this build of zstd"
+
+        display_str(s, out, fmt)
+end Error
+
+// What a frame header says about the size of its content.
+//
+// **Three answers rather than a number**, because the two that are not lengths are the interesting
+// ones: a stream written without the length known says `Unknown`, and bytes that are not a frame at
+// all say `NotAFrame`. A binding folding either into zero would make an empty frame and a hostile
+// input look alike.
+enum FrameSize
+    // The header claims this many bytes. **A claim, not a fact** — a frame from somewhere else can
+    // say anything, and only decompressing it finds out. zstd checks the claim against what it
+    // produces, so a lie is refused rather than believed.
+    Known(n: usize)
+
+    // The frame is valid and carries no length. Ordinary: a streaming encoder that was not told how
+    // much was coming writes exactly this.
+    Unknown
+
+    // Not a zstd frame, or fewer bytes than a frame header.
+    NotAFrame
+end FrameSize
+
+// A variant here carries a payload, so `==` is not the automatic one a bare enum gets and has to be
+// written. It is worth writing: a caller comparing against `Unknown` is the ordinary use.
+impl Eq for FrameSize
+    eq(self, other: FrameSize) -> bool = self match
+        Known(a) -> other match
+            Known(b) -> a == b
+            _ -> false
+        Unknown -> other match
+            Unknown -> true
+            _ -> false
+        NotAFrame -> other match
+            NotAFrame -> true
+            _ -> false
+end FrameSize
+
+impl Display for FrameSize
+    display(self, out: *Writer, fmt: FormatSpec)
+        val s = self match
+            Known(n) -> f"$n%d bytes"
+            Unknown -> "an undeclared length"
+            NotAFrame -> "not a frame"
+
+        display_str(s, out, fmt)
+end FrameSize
+
+// What a step of a compression is being asked to do.
+enum End
+    // Take the input and emit whatever the encoder feels like. The best ratio, and the answer for
+    // every chunk but the ones that have to be readable.
+    Continue
+
+    // Close a block, so that everything offered so far can be decoded by a reader that has it. The
+    // frame continues, so later data can still reference earlier data — this is what a long-lived
+    // stream that has to be readable before it ends uses, and it costs a little ratio each time.
+    Flush
+
+    // Flush and write the frame epilogue. **A frame is only a frame once this has answered
+    // `done`**; a decoder will not consider one complete without the epilogue.
+    Finish
+
+    private[zstd] value(self) -> int = self match
+        Continue -> c.E_CONTINUE
+        Flush    -> c.E_FLUSH
+        Finish   -> c.E_END
+end End
+
+// How far a single step got. The counts are of this call, not of the stream.
+struct Progress
+    // Input bytes taken. Less than the slice's length means the output filled first, and the rest
+    // of the input has still to be offered.
+    consumed: usize
+
+    // Output bytes written, at the end of what earlier steps wrote.
+    produced: usize
+
+    // Whether the **frame** is complete: for an encoder, `Finish` was asked for and everything has
+    // been flushed; for a decoder, the end of a frame was reached. A `Flush` or a `Continue` never
+    // answers `true`, whatever it left buffered — `remaining` is the field for that.
+    done: bool
+
+    // zstd's own estimate of what is still held inside the context, in bytes. Zero means nothing is
+    // held. It is a *hint* and not a promise, and it is here because a caller draining a socket
+    // wants to know whether another call is worth making before more input arrives.
+    remaining: usize
+end Progress
+
+// ## What the library is
+
+// The version actually linked, as zstd reports it — `"1.5.7"`. Worth printing in a diagnostic: a
+// frame one machine reads and another does not is nearly always two builds apart.
+version() -> string = from_cstring(c.version_string()).unwrap_or("unknown")
+
+// The same, as `major * 10000 + minor * 100 + patch`, for comparing.
+version_number() -> u32 = c.version_number()
+
+// The lowest level this build accepts. **It is deeply negative** — -131072 on zstd 1.5 — because the
+// negative levels are a different regime rather than more of the same one: they trade ratio for
+// speed until the compressor is barely doing anything, and each step down roughly doubles the block
+// it will not bother searching.
+min_level() -> int = c.min_clevel()
+
+// The highest level, 22 on zstd 1.5. Levels above 19 need far more memory at both ends and are
+// refused by some decoders' default window limits, which is why the `zstd` command asks for
+// `--ultra` before it will use one.
+max_level() -> int = c.max_clevel()
+
+// What zstd picks when nothing says otherwise, 3 on zstd 1.5. It is genuinely a good default: on
+// most inputs it beats gzip's ratio at several times gzip's speed.
+default_level() -> int = c.default_clevel()
+
+// The most compression workers this build will accept, and **zero where it was built without
+// multithreading at all**. This is the documented way to ask, and it is a property of the installed
+// library rather than of this package.
+max_workers() -> int
+    val b = c.cparam_get_bounds(c.C_NB_WORKERS)
+
+    if c.is_error(b.error) != 0 then 0 else b.upper
+
+// Whether the installed zstd can compress on more than one thread. `brew install zstd` and Debian's
+// `libzstd-dev` both answer `true`; a hand-built copy without `ZSTD_MULTITHREAD` answers `false`.
+has_multithreading() -> bool = max_workers() > 0
+
+// The largest a compressed frame can be for an input of `len` bytes.
+//
+// Incompressible input is *larger* compressed than raw, because zstd has to frame it — so this is
+// what a slice given to `compress_into` must be for the call to be certain of fitting. It is tight
+// rather than generous: 65,824 bytes for 65,536 and 1,052,672 for a megabyte, which is a margin of
+// about one part in 256 plus a small fixed allowance. Reach for
+// `compress` unless the answer has to go somewhere already allocated.
+compress_bound(len: usize) -> usize = c.compress_bound(len)
+
+// Whether `src` starts with a zstd frame, read from the four-byte magic number alone.
+//
+// **A skippable frame answers `false`**, which is deliberate: a skippable frame is a container for
+// somebody else's metadata and holds no compressed content, so a caller asking "can I decompress
+// this" wants the narrower question answered.
+is_frame(src: []const u8) -> bool
+    if src.len < 4 then return false
+
+    val magic = u32(src[0]) | (u32(src[1]) << 8) | (u32(src[2]) << 16) | (u32(src[3]) << 24)
+
+    magic == c.MAGICNUMBER
+
+// What the frame header claims its content decompresses to.
+//
+// Reads the header only, so a few bytes of a frame are enough and nothing is decompressed. See
+// `FrameSize` for why the answer is three cases rather than a number.
+frame_content_size(src: []const u8) -> FrameSize
+    val n = c.frame_content_size(as_ptr(src), src.len)
+
+    if n == c.CONTENTSIZE_ERROR then return NotAFrame
+    if n == c.CONTENTSIZE_UNKNOWN then return Unknown
+
+    Known(usize(n))
+
+// How long the first frame in `src` is, for a reader walking a concatenation of them.
+//
+// zstd may have to scan the frame's content to find its end, so this is not free the way
+// `frame_content_size` is. `Corrupt` where `src` does not hold one whole frame.
+frame_compressed_size(src: []const u8) -> Result[usize, Error]
+    val n = c.frame_compressed_size(as_ptr(src), src.len)
+
+    if c.is_error(n) != 0 then return Err(fault(n))
+
+    Ok(n)
+
+// The dictionary ID a frame was compressed against, or zero where it names none.
+frame_dict_id(src: []const u8) -> u32 = c.dict_id_from_frame(as_ptr(src), src.len)
+
+// The ID carried by a dictionary, or zero where the bytes are a raw-content dictionary rather than
+// one zstd's trainer produced.
+dict_id(dict: []const u8) -> u32 = c.dict_id_from_dict(as_ptr(dict), dict.len)
+
+// ## Encoding
+
+// A zstd compression context. Free it by letting it go out of scope; there is no close.
+struct Encoder
+    private cx: *c.CCtx
+
+    // Where in the destination the next output goes, so a caller feeding several chunks does not
+    // have to track it. `drained` puts it back to zero.
+    written: usize
+
+    // Take another chunk of input, writing into `dst` after everything written so far.
+    //
+    // `dst` must be the **same slice** on every call — the encoder writes at a growing offset into
+    // it, and `written` is that offset. Pass `Finish` on the last chunk, or on the only one; until
+    // then the encoder is entitled to hold everything back, and a `produced` of zero is routine for
+    // a chunk that has not filled a block.
+    //
+    // A `Progress` whose `consumed` is short of `src.len` means `dst` filled up. That is not an
+    // error — offer the rest after draining — and a `done` of `false` after `Finish` means the same
+    // thing: call again with room and no new input.
+    push(*self, src: []const u8, dst: []u8, op: End = End.Continue) -> Result[Progress, Error]
+        var input = c.InBuffer(as_ptr(src), src.len, 0)
+        var output = c.OutBuffer(as_mut_ptr(dst), dst.len, self.written)
+
+        val remaining = c.compress_stream2(self.cx, &output, &input, op.value())
+
+        if c.is_error(remaining) != 0 then return Err(fault(remaining))
+
+        val produced = output.pos - self.written
+
+        self.written = output.pos
+
+        // **A frame is only complete when `Finish` has flushed everything**, so `done` says that and
+        // nothing else. A `Continue` that happened to leave nothing buffered also answers zero, and
+        // reading that as a finished frame is the mistake this field exists to prevent — the
+        // epilogue would never be written and no decoder would accept what came out. What a `Flush`
+        // caller wants is `remaining`.
+        Ok(Progress(input.pos, produced, op == End.Finish && remaining == 0, remaining))
+    end push
+
+    // Say that everything written so far has been taken away, so the next `push` writes at the
+    // start of `dst` again.
+    //
+    // **This is what makes the caller-owned destination workable for a socket**: without it the one
+    // slice would have to be as large as the whole compressed stream. It changes nothing inside
+    // zstd — the frame carries on across the call — it only moves this encoder's own cursor.
+    drained(*self) = self.written = 0
+
+    // What this context is actually holding, in bytes, now that its parameters have been applied.
+    //
+    // Measured rather than estimated: it is what zstd reports about itself, and it moves with the
+    // level, the window and the pledged size. Worth printing when deciding how many of these a
+    // server can afford at once.
+    footprint(self) -> usize = c.sizeof_cctx(self.cx)
+end Encoder
+
+impl Drop for Encoder
+    drop(self) = c.free_cctx(self.cx)
+
+// A new encoder.
+//
+// **`window` of zero means whatever the level implies**, which is nearly always right; give it a
+// number in `10..31` to bound what a decoder will have to hold. **`workers` of zero is
+// single-threaded**, and anything above it needs a library built with multithreading — ask
+// `max_workers()` first, or read the `OutOfRange` this answers, whose range is `0` to `0` on a build
+// without it.
+//
+// `content_size` writes the length into the frame header where it is known; for a streaming encode
+// it is only known if `pledge` is called, so a stream written without one carries no length whatever
+// this says. `checksum` adds a 32-bit XXH64 digest of the content at the end of the frame, which the
+// decoder verifies for you.
+encoder(level: int = default_level(), checksum: bool = false, content_size: bool = true,
+        window: int = 0, workers: int = 0) -> Result[&Encoder, Error]
+    check_bound("level", c.C_LEVEL, level)?
+
+    if window != 0 then check_bound("window", c.C_WINDOW_LOG, window)?
+
+    check_bound("workers", c.C_NB_WORKERS, workers)?
+
+    var e = raw_encoder()?
+
+    // **Nothing here owns the context yet**, so a refusal has to release it where it stands rather
+    // than trusting a destructor: an `Err` means no box was ever made of this encoder. That is the
+    // error-path half of the boxed-constructor rule, and it is the half a green suite never sees.
+    configure(e.cx, level, checksum, content_size, window, workers) match
+        Ok(_) -> ()
+        Err(why) -> return Err(why)
+
+    Ok(e)
+end encoder
+
+// A context with nothing set on it, in the box that owns it.
+private raw_encoder() -> Result[&Encoder, Error]
+    val cx = c.create_cctx()
+
+    if usize(cx) == 0 then return Err(NoMemory)
+
+    Ok(Encoder(cx, 0))
+
+private configure(cx: *c.CCtx, level: int, checksum: bool, content_size: bool, window: int,
+                  workers: int) -> Result[unit, Error]
+    set(cx, c.C_LEVEL, level)?
+    set(cx, c.C_CHECKSUM, if checksum then 1 else 0)?
+    set(cx, c.C_CONTENT_SIZE, if content_size then 1 else 0)?
+
+    if window != 0 then set(cx, c.C_WINDOW_LOG, window)?
+
+    if workers != 0 then set(cx, c.C_NB_WORKERS, workers)?
+
+    Ok(())
+end configure
+
+// Tell the encoder how many bytes the frame is going to hold, before anything is pushed.
+//
+// **This is what puts a length in the header of a streamed frame**, so that a reader can ask
+// `frame_content_size` and get an answer. zstd checks the pledge at the end of the frame: a stream
+// that does not honour it is refused rather than written wrong, which surfaces here as `Truncated`
+// from the last `push`.
+pledge(e: &Encoder, len: usize) -> Result[unit, Error]
+    val r = c.cctx_set_pledged_src_size(e.cx, u64(len))
+
+    if c.is_error(r) != 0 then return Err(fault(r))
+
+    Ok(())
+
+// Compress `src`, answering a buffer that holds exactly the result.
+//
+// The destination is sized at `compress_bound(src.len)` and the answer copied out of it, so nothing
+// has to be sized by the caller. `compress_into` is for a destination that already exists.
+//
+// **A `workers` above zero is driven in two steps rather than one**, because zstd delegates a
+// single-call compression to its blocking path and would start no worker at all — see
+// `compress_into`'s own note.
+compress(src: []const u8, level: int = default_level(), checksum: bool = false,
+         window: int = 0, workers: int = 0) -> Result[Buf[u8], Error]
+    var dst: []u8 = [0; c.compress_bound(src.len)]
+
+    val n = compress_into(src, dst, level, checksum, window, workers)?
+
+    var out: Buf[u8] = buf_with_capacity(n, 0)
+
+    out.extend(dst[0..<n])
+
+    Ok(out)
+end compress
+
+// Compress `src` into `dst` in one call, answering how many bytes were written.
+//
+// **`Short` carries `compress_bound(src.len)` — a ceiling rather than the exact figure — and that is
+// forced rather than lazy.** zstd's one-shot needs *headroom past the answer*: 8,000 bytes of
+// repeating text compress to 66, and a destination of 66, 70 or 73 bytes is refused with
+// `dstSize_tooSmall` while 74 succeeds. So the size of the answer is not a size a caller can retry
+// at, and reporting it would be handing back a figure that fails again — which is worse than a
+// ceiling, because it fails *silently in a loop*. `sh.sysl.brotli` can name the exact figure and
+// this cannot; the reason is the library's rather than the binding's, and the suite pins it.
+compress_into(src: []const u8, dst: []u8, level: int = default_level(), checksum: bool = false,
+              window: int = 0, workers: int = 0) -> Result[usize, Error]
+    var e = encoder(level, checksum, content_size = true, window = window, workers = workers)?
+
+    if workers > 0 then return parallel_into(e, src, dst)
+
+    val n = c.compress2(e.cx, as_mut_ptr(dst), dst.len, as_ptr(src), src.len)
+
+    if c.is_error(n) == 0 then return Ok(n)
+
+    if c.error_code(n) != c.E_DST_SIZE_TOO_SMALL then return Err(fault(n))
+
+    Err(Short(c.compress_bound(src.len)))
+end compress_into
+
+// **A one-shot compression asking for workers has to be driven in two steps, or it silently runs on
+// one thread.** zstd delegates a `ZSTD_e_end` on the *first* call to its blocking single-shot path —
+// its own note says so — so no worker is ever started: measured, the context is 1.57 MB either way
+// when the frame is closed in one call and 3.7 MB against 51.7 MB when it is not. Offering the input
+// first and closing afterwards is what makes the parameter mean anything.
+private parallel_into(e: &Encoder, src: []const u8, dst: []u8) -> Result[usize, Error]
+    pledge(e, src.len)?
+
+    val offered = e.push(src, dst, End.Continue)?
+
+    if offered.consumed < src.len then return Err(Short(c.compress_bound(src.len)))
+
+    loop
+        val before = e.written
+        val step = e.push([], dst, End.Finish)?
+
+        if step.done then break
+
+        if e.written == dst.len || e.written == before then
+            return Err(Short(c.compress_bound(src.len)))
+
+    Ok(e.written)
+end parallel_into
+
+// ## Decoding
+
+// A zstd decompression context. Free it by letting it go out of scope; there is no close.
+struct Decoder
+    private dx: *c.DCtx
+
+    // How much of the destination has been filled. `drained` puts it back to zero.
+    written: usize
+
+    // Whether the end of a frame has been reached.
+    done: bool
+
+    // Take another chunk of input, writing into `dst` after everything written so far.
+    //
+    // `dst` must be the **same slice** on every call. `more` says whether further input exists: pass
+    // it on every chunk but the last, so that an input which simply stops can be told from one that
+    // is corrupt. A `Progress` whose `consumed` is short of `src.len` means `dst` filled up, and the
+    // remaining input must be offered again after the destination is drained.
+    push(*self, src: []const u8, dst: []u8, more: bool = false) -> Result[Progress, Error]
+        var input = c.InBuffer(as_ptr(src), src.len, 0)
+        var output = c.OutBuffer(as_mut_ptr(dst), dst.len, self.written)
+
+        val remaining = c.decompress_stream(self.dx, &output, &input)
+
+        if c.is_error(remaining) != 0 then return Err(fault(remaining))
+
+        val produced = output.pos - self.written
+
+        self.written = output.pos
+        self.done = remaining == 0
+
+        // Everything offered was taken, the frame did not end, and there is nowhere else for the
+        // bytes to come from. A full destination is the other reason to stop and is not this one.
+        if !self.done && !more && input.pos == src.len && output.pos < dst.len
+            return Err(Truncated)
+
+        Ok(Progress(input.pos, produced, self.done, remaining))
+    end push
+
+    // Say that everything written so far has been taken away, so the next `push` writes at the
+    // start of `dst` again.
+    drained(*self) = self.written = 0
+
+    // What this context is actually holding, in bytes. A decoder is far cheaper than an encoder —
+    // it needs the window and little else — which is why the asymmetric arrangement `miniz`
+    // describes is even more pronounced here.
+    footprint(self) -> usize = c.sizeof_dctx(self.dx)
+end Decoder
+
+impl Drop for Decoder
+    drop(self) = c.free_dctx(self.dx)
+
+// A new decoder.
+//
+// **`window` bounds what a frame may ask this decoder to hold**, in bits, and is the memory limit on
+// reading somebody else's stream — a frame wanting more is refused rather than served. Zero leaves
+// zstd's own default, which is 27 bits, or 128 MB.
+decoder(window: int = 0) -> Result[&Decoder, Error]
+    if window != 0 then check_dbound("window", c.D_WINDOW_LOG_MAX, window)?
+
+    val dx = c.create_dctx()
+
+    if usize(dx) == 0 then return Err(NoMemory)
+
+    var d = Decoder(dx, 0, false)
+
+    if window != 0
+        val r = c.dctx_set_parameter(dx, c.D_WINDOW_LOG_MAX, window)
+
+        // Nothing owns the context on this path either, so it is released here.
+        if c.is_error(r) != 0
+            c.free_dctx(dx)
+
+            return Err(fault(r))
+
+    Ok(d)
+end decoder
+
+// Decompress `src`, answering a buffer that holds exactly the result — but never more than `limit`
+// bytes.
+//
+// **`limit` is required and is the whole safety story**; see the module's own note above for why
+// there is no form that omits it. Where the frame header carries a length the buffer is sized for it
+// up front, and where it does not the answer grows as it arrives; either way the limit is checked as
+// output is produced rather than once it is all there.
+//
+// A `src` holding several frames back to back decompresses to all of them, which is what a `.zst`
+// written by `cat a.zst b.zst` is.
+decompress(src: []const u8, limit: usize) -> Result[Buf[u8], Error] = stream_out(decoder()?, src, limit)
+
+// Decompress `src` into `dst`, answering how many bytes were written.
+//
+// **`dst`'s length is the limit**, so there is no separate bound to pass. An answer that does not fit
+// is `Short` carrying the exact size wanted — which for a frame that declares no length means the
+// whole thing was decompressed to find out, so this is not the call for input that cannot be
+// trusted. Use `decompress` with a limit for that.
+decompress_into(src: []const u8, dst: []u8) -> Result[usize, Error]
+    frame_content_size(src) match
+        Known(n) -> if n > dst.len then return Err(Short(n))
+        _ -> ()
+
+    var d = decoder()?
+
+    val n = c.decompress_dctx(d.dx, as_mut_ptr(dst), dst.len, as_ptr(src), src.len)
+
+    if c.is_error(n) == 0 then return Ok(n)
+
+    if c.error_code(n) != c.E_DST_SIZE_TOO_SMALL then return Err(fault(n))
+
+    // It did not fit and the frame would not say how large it is. Find out, which costs a second
+    // decompression and is only reached on the path that was going to fail anyway.
+    val whole = decompress(src, 0xffffffff)?
+
+    Err(Short(whole.len()))
+end decompress_into
+
+// ## Dictionaries
+//
+// **A dictionary is what makes zstd worth having for many small similar payloads.** Compressing a
+// 200-byte JSON record on its own leaves almost nothing to reference; compressing it against a
+// corpus of records like it leaves almost everything. Both ends have to hold the same bytes, and a
+// frame records which dictionary it used so a mismatch is refused rather than decoded to nonsense.
+//
+// The bytes may be a dictionary the `zstd --train` command produced, or simply a lump of
+// representative content — zstd accepts a raw corpus, and calls what it does with one "raw content"
+// mode. `dict_id` says which of the two you have.
+
+// Compress `src` against `dict`, answering a buffer that holds exactly the result.
+compress_with_dict(src: []const u8, dict: []const u8,
+                   level: int = default_level()) -> Result[Buf[u8], Error]
+    check_bound("level", c.C_LEVEL, level)?
+
+    var e = raw_encoder()?
+
+    var dst: []u8 = [0; c.compress_bound(src.len)]
+
+    val n = c.compress_using_dict(e.cx, as_mut_ptr(dst), dst.len, as_ptr(src), src.len,
+                                  as_ptr(dict), dict.len, level)
+
+    if c.is_error(n) != 0 then return Err(fault(n))
+
+    var out: Buf[u8] = buf_with_capacity(n, 0)
+
+    out.extend(dst[0..<n])
+
+    Ok(out)
+end compress_with_dict
+
+// Decompress `src` against `dict`, never producing more than `limit` bytes.
+//
+// **A frame compressed against a different dictionary is refused**, carrying zstd's own
+// `dictionary_wrong` — which is worth far more than a plausible-looking wrong answer, and is what
+// the ID in the frame header is for.
+decompress_with_dict(src: []const u8, dict: []const u8, limit: usize) -> Result[Buf[u8], Error]
+    var d = decoder()?
+
+    val loaded = c.dctx_load_dictionary(d.dx, as_ptr(dict), dict.len)
+
+    if c.is_error(loaded) != 0 then return Err(fault(loaded))
+
+    stream_out(d, src, limit)
+end decompress_with_dict
+
+// A dictionary digested once and referenced many times.
+//
+// **Building one costs roughly what compressing the dictionary costs, and referencing it costs
+// nothing** — which is the whole point where a server compresses thousands of small payloads against
+// one corpus. It carries the level it was built for; compressing against it at another level is
+// what `compress_with_dict` is for.
+struct CDict
+    private cd: *c.CDict
+
+    // Compress `src` against this dictionary.
+    compress(&self, src: []const u8) -> Result[Buf[u8], Error]
+        var e = raw_encoder()?
+
+        val referenced = c.cctx_ref_cdict(e.cx, self.cd)
+
+        if c.is_error(referenced) != 0 then return Err(fault(referenced))
+
+        var dst: []u8 = [0; c.compress_bound(src.len)]
+
+        val n = c.compress2(e.cx, as_mut_ptr(dst), dst.len, as_ptr(src), src.len)
+
+        if c.is_error(n) != 0 then return Err(fault(n))
+
+        var out: Buf[u8] = buf_with_capacity(n, 0)
+
+        out.extend(dst[0..<n])
+
+        Ok(out)
+    end compress
+end CDict
+
+impl Drop for CDict
+    drop(self) = c.free_cdict(self.cd)
+
+// Digest `dict` for compressing at `level`.
+cdict(dict: []const u8, level: int = default_level()) -> Result[&CDict, Error]
+    check_bound("level", c.C_LEVEL, level)?
+
+    val cd = c.create_cdict(as_ptr(dict), dict.len, level)
+
+    if usize(cd) == 0 then return Err(NoMemory)
+
+    Ok(CDict(cd))
+
+// A dictionary digested once for decompressing.
+struct DDict
+    private dd: *c.DDict
+
+    // Decompress `src` against this dictionary, never producing more than `limit` bytes.
+    decompress(&self, src: []const u8, limit: usize) -> Result[Buf[u8], Error]
+        var d = decoder()?
+
+        val referenced = c.dctx_ref_ddict(d.dx, self.dd)
+
+        if c.is_error(referenced) != 0 then return Err(fault(referenced))
+
+        stream_out(d, src, limit)
+    end decompress
+end DDict
+
+impl Drop for DDict
+    drop(self) = c.free_ddict(self.dd)
+
+// Digest `dict` for decompressing.
+ddict(dict: []const u8) -> Result[&DDict, Error]
+    val dd = c.create_ddict(as_ptr(dict), dict.len)
+
+    if usize(dd) == 0 then return Err(NoMemory)
+
+    Ok(DDict(dd))
+
+// ## The parts every path here shares
+
+// Drive a prepared decoder over the whole of `src`, growing the answer and stopping at `limit`.
+//
+// This is `decompress`'s loop, reached by the dictionary forms as well — the only difference between
+// them is what was loaded into the context before the first byte was offered.
+private stream_out(d: &Decoder, src: []const u8, limit: usize) -> Result[Buf[u8], Error]
+    // Where the header carries a length the answer is sized for it up front, which is one allocation
+    // instead of a doubling ladder. It is still only a claim, so the limit is checked as output
+    // arrives whatever the header said.
+    var out: Buf[u8] = frame_content_size(src) match
+        Known(n) ->
+            if n > limit then return Err(TooLarge(limit))
+
+            buf_with_capacity(n, 0)
+        _ -> buf()
+
+    var scratch: []u8 = [0; c.dstream_out_size()]
+    var input = c.InBuffer(as_ptr(src), src.len, 0)
+
+    loop
+        var output = c.OutBuffer(as_mut_ptr(scratch), scratch.len, 0)
+
+        val before = input.pos
+        val remaining = c.decompress_stream(d.dx, &output, &input)
+
+        if c.is_error(remaining) != 0 then return Err(fault(remaining))
+
+        if out.len() + output.pos > limit then return Err(TooLarge(limit))
+
+        out.extend(scratch[0..<output.pos])
+
+        if remaining == 0 && input.pos == src.len then break
+
+        if output.pos == scratch.len then continue
+
+        if input.pos == src.len && remaining != 0 then return Err(Truncated)
+
+        if input.pos == before && output.pos == 0 then return Err(Truncated)
+
+    Ok(out)
+end stream_out
+
+// Read zstd's own account of a failed call.
+//
+// **Two codes are acted on rather than reported.** `srcSize_wrong` is what a frame that stopped in
+// the middle answers, and a caller does something different about that from what it does about a
+// frame that is wrong. `memory_allocation` is the other, since running out of memory is not a
+// property of the input.
+private fault(result: usize) -> Error
+    val code = c.error_code(result)
+
+    if code == c.E_SRC_SIZE_WRONG then return Truncated
+    if code == c.E_MEMORY_ALLOCATION then return NoMemory
+
+    // zstd's messages are ASCII by construction, so the decode cannot fail; a name is still better
+    // than an unwrap that would abort a server on the one path it is meant to survive.
+    Corrupt(code, from_cstring(c.error_name(result)).unwrap_or("unreadable"))
+end fault
+
+// Check a compression parameter against the range this build of zstd reports for it.
+//
+// **The range is asked for rather than transcribed**, which is what makes the `workers` case work:
+// on a library built without multithreading the bounds come back `0` to `0`, so a request for a
+// worker is refused with the real reason instead of being silently ignored.
+private check_bound(what: string, param: int, value: int) -> Result[unit, Error]
+    val b = c.cparam_get_bounds(param)
+
+    if c.is_error(b.error) != 0 then return Err(OutOfRange(what, 0, 0))
+
+    if value < b.lower || value > b.upper then return Err(OutOfRange(what, b.lower, b.upper))
+
+    Ok(())
+
+private check_dbound(what: string, param: int, value: int) -> Result[unit, Error]
+    val b = c.dparam_get_bounds(param)
+
+    if c.is_error(b.error) != 0 then return Err(OutOfRange(what, 0, 0))
+
+    if value < b.lower || value > b.upper then return Err(OutOfRange(what, b.lower, b.upper))
+
+    Ok(())
+
+private set(cx: *c.CCtx, param: int, value: int) -> Result[unit, Error]
+    val r = c.cctx_set_parameter(cx, param, value)
+
+    if c.is_error(r) != 0 then return Err(fault(r))
+
+    Ok(())

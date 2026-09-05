@@ -1,0 +1,1056 @@
+// What this package claims, checked against zstd's own command line wherever a check could fail.
+//
+// **The honest limit on the corroboration is worth stating first.** `zstd` the command links the
+// same `libzstd` this package calls, so a frame the two agree about says nothing about the *format*
+// — both would agree about a mistake in the library. What it does check, and what nothing else here
+// can, is the **binding**: that the parameters reach the context the caller asked for, that the two
+// cursor structs are advanced the way zstd expects, that a dictionary is really loaded, and that the
+// streaming loop does not lose a byte at a chunk boundary. Every one of those is a defect that
+// round-tripping against ourselves would pass.
+//
+// There is no from-scratch zstd implementation on this machine to be the second oracle qrcodegen's
+// lesson asks for — Python 3.14's `compression.zstd` and Node's `zlib.zstdCompress` are both
+// bindings of this same library, so neither adds anything. The suite therefore does not claim to
+// have read the format; it claims to have driven the library correctly.
+//
+// **The cross-check is skipped rather than failed where the command is not installed**, since a
+// machine can have the library without the tool.
+
+module sh.sysl.zstd
+@tests
+
+import sysl.harness.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_bytes, write_bytes, remove_file, exists, make_temp_dir}
+import sysl.process.{run, Status}
+
+// -- What the suite compresses ---------------------------------------------------------------------
+
+// Text that repeats, which is what a compressor is for.
+private repetitive(n: usize) -> []u8
+    val line = "the quick brown fox jumps over the lazy dog. ".bytes
+
+    var out: []u8 = [0; n]
+
+    for i in 0..<n do out[i] = line[i % line.len]
+
+    out
+
+// Bytes with no structure in them, from a xorshift so that the suite does not depend on a clock or
+// on anybody's random number generator. **This is the input every buffer-sizing mistake shows up
+// on**, because the answer is larger than what went in.
+private noise(n: usize) -> []u8
+    var out: []u8 = [0; n]
+    var x: u32 = 0x2545F491
+
+    for i in 0..<n
+        x = x ^ (x << 13)
+        x = x ^ (x >> 17)
+        x = x ^ (x << 5)
+
+        out[i] = u8(x & 255)
+
+    out
+
+// Text with noise threaded through it, which is the only input on which the **level** makes a
+// visible difference.
+//
+// **Purely repeating text is the wrong fixture for that**, and finding out cost a mutation check:
+// 20,000 bytes of one repeating line compress to 63-66 bytes at *every* level from -20 to 22, so a
+// test asserting that a higher level does better passes just as well on a binding that never sets
+// the level at all. This input compresses to 20,010 bytes at the lowest level and 977 at the
+// highest, which is a difference a test can stand on.
+private mixed(n: usize) -> []u8
+    val line = "the quick brown fox jumps over the lazy dog. ".bytes
+
+    var out: []u8 = [0; n]
+    var x: u32 = 0x9E3779B9
+
+    for i in 0..<n
+        if i % 8 == 0
+            x = x ^ (x << 13)
+            x = x ^ (x >> 17)
+            x = x ^ (x << 5)
+
+            out[i] = u8(x & 255)
+        else
+            out[i] = line[i % line.len]
+
+    out
+
+// `Buf.view()` answers a `[]u8` and a literal is a `[]const u8`; the two are different types and
+// deliberately so, and a parameter is where they meet.
+private same(got: []const u8, want: []const u8, what: string = "bytes differ") =
+    assert_eq(got, want, what)
+
+private round_trip(src: []const u8, level: int, what: string)
+    val out = compress(src, level).unwrap()
+
+    same(decompress(out.view(), src.len + 4096).unwrap().view(), src, what)
+
+// -- Round trips -----------------------------------------------------------------------------------
+
+// **Not one test but nine.** zstd's levels are several different compressors sharing a format: the
+// negative ones skip most of the match search, 1 to 3 use the fast strategies, the middle uses
+// double-fast and lazy, and 17 upward use the optimal parser with a much larger window. A binding
+// that passed the level to the wrong parameter slot would still round-trip at every one of them and
+// would fail `higher_levels_compress_better` below, which is why both tests are here.
+@test("a representative level from every one of zstd's regimes round-trips")
+every_regime_round_trips()
+    val src = repetitive(20000)
+
+    for level in [min_level(), -20, -1, 0, 1, 3, 9, 19, max_level()]
+        round_trip(src, level, "a level did not survive a round trip")
+
+// **The strict inequalities are the point.** A binding that dropped the level on the floor would
+// compress everything at zstd's default and still satisfy `<=` and `>=`; only `<` and `>` say that
+// the number reached the context.
+@test("the level reaches the context: a higher one is strictly smaller, a lower one strictly larger")
+higher_levels_compress_better()
+    val src = mixed(20000)
+
+    val fast = compress(src, 1).unwrap()
+    val slow = compress(src, 19).unwrap()
+
+    assert(slow.len() < fast.len(),
+        "level 19 should beat level 1 on 20 KB of text with noise through it")
+
+    // And the negative regime really is a different one: at the very bottom zstd stops compressing
+    // at all and the answer is larger than the input.
+    val hasty = compress(src, min_level()).unwrap()
+
+    assert(hasty.len() > fast.len(), "the lowest level should lose badly to level 1")
+    assert(hasty.len() > src.len, "and at the very bottom it should not compress at all")
+end higher_levels_compress_better
+
+@test("compressing nothing gives a frame, and it decodes to nothing")
+empty_input_round_trips()
+    val out = compress([]).unwrap()
+
+    assert(out.len() > 0, "even an empty frame has a header and an epilogue")
+    assert(is_frame(out.view()), "and it is a frame")
+    assert_eq(decompress(out.view(), 16).unwrap().len(), 0)
+end empty_input_round_trips
+
+@test("one byte round-trips")
+one_byte_round_trips()
+    round_trip([104], default_level(), "one byte")
+
+// Incompressible input is the case a caller sizing a buffer to the input gets wrong, so it is worth
+// its own test: the answer is *larger* than what went in.
+@test("a megabyte of noise comes out larger, and still round-trips")
+incompressible_input_grows()
+    val src = noise(1 << 20)
+
+    val out = compress(src).unwrap()
+
+    assert(out.len() > src.len, "a megabyte of noise cannot compress; zstd has to frame it")
+    assert(out.len() <= compress_bound(src.len), "and it must fit inside the bound")
+
+    same(decompress(out.view(), (1 << 20) + 4096).unwrap().view(), src)
+end incompressible_input_grows
+
+@test("a megabyte of repeating text compresses hugely and round-trips")
+compressible_input_shrinks()
+    val src = repetitive(1 << 20)
+
+    val out = compress(src).unwrap()
+
+    assert(out.len() < src.len / 100, "a megabyte of one repeating line should go under 10 KB")
+
+    same(decompress(out.view(), (1 << 20) + 4096).unwrap().view(), src)
+end compressible_input_shrinks
+
+// Two frames written back to back are what `cat a.zst b.zst` produces, and zstd reads them as one
+// stream. A binding that stopped at the first frame's epilogue would silently drop half the answer.
+@test("frames written back to back decompress to the concatenation")
+concatenated_frames()
+    val first = compress("hello, ".bytes).unwrap()
+    val second = compress("zstandard".bytes).unwrap()
+
+    var both: Buf[u8] = buf()
+
+    both.extend(first.view())
+    both.extend(second.view())
+
+    same(decompress(both.view(), 1 << 16).unwrap().view(), "hello, zstandard".bytes)
+end concatenated_frames
+
+// -- Into a caller's slice ---------------------------------------------------------------------------
+
+@test("the bound is a ceiling, and a slice that size always fits")
+bound_is_enough()
+    assert(compress_bound(0) > 0)
+
+    val src = noise(4096)
+
+    var dst: []u8 = [0; compress_bound(src.len)]
+
+    val n = compress_into(src, dst).unwrap()
+
+    same(decompress(dst[0..<n], 8192).unwrap().view(), src)
+end bound_is_enough
+
+// **`Short` carries the bound rather than the size of the answer, and this is the test that says
+// why.** zstd's one-shot needs headroom past what it produces: 8,000 bytes of repeating text
+// compress to 66, and a destination of exactly 66 bytes is refused. A `Short(66)` would therefore be
+// a figure a caller retries at and fails at again, in a loop, with no error that says so — which is
+// worse than a ceiling. `sh.sysl.brotli` can name the exact figure; this cannot, and the reason is
+// the library's.
+@test("Short carries a size that actually works, which is the bound and not the answer")
+short_carries_a_size_that_works()
+    val src = repetitive(8000)
+    val whole = compress(src).unwrap()
+
+    var dst: []u8 = [0; compress_bound(src.len)]
+
+    // The trap, pinned: a destination the exact size of the answer is refused.
+    assert(compress_into(src, dst[0..<whole.len()]).is_err(),
+        "if zstd ever stops needing headroom, Short should go back to carrying the exact figure")
+
+    compress_into(src, dst[0..<whole.len() - 1]) match
+        Err(Short(needed)) ->
+            assert_eq(needed, compress_bound(src.len))
+
+            // And the figure it reports is one a caller can actually retry at.
+            assert_eq(compress_into(src, dst[0..<needed]).unwrap(), whole.len())
+        Err(e) -> assert(false, "wanted Short")
+        Ok(n) -> assert(false, "it fit in one byte less than it takes")
+end short_carries_a_size_that_works
+
+@test("decompressing into a slice fills it, and a short one says how much was wanted")
+decompress_into_a_slice()
+    val src = repetitive(3000)
+    val packed = compress(src).unwrap()
+
+    var dst: []u8 = [0; 4096]
+
+    val n = decompress_into(packed.view(), dst).unwrap()
+
+    assert_eq(n, src.len)
+    same(dst[0..<n], src)
+
+    decompress_into(packed.view(), dst[0..<100]) match
+        Err(Short(needed)) -> assert_eq(needed, src.len)
+        Err(e) -> assert(false, "wanted Short")
+        Ok(m) -> assert(false, "3000 bytes fit in 100")
+
+    // **Decompression needs no headroom**, unlike the compression above: a slice exactly the size of
+    // the answer is enough, which is why `Short` here is the exact figure rather than a ceiling.
+    assert_eq(decompress_into(packed.view(), dst[0..<src.len]).unwrap(), src.len)
+
+    // And a truncated frame is refused here too rather than filling what it can and reporting a
+    // count, which is the answer a caller must not be given.
+    decompress_into(packed.view()[0..<packed.len() / 2], dst) match
+        Err(Truncated) -> ()
+        Err(e) -> assert(false, "wanted Truncated")
+        Ok(m) -> assert(false, "half a frame filled a slice")
+end decompress_into_a_slice
+
+// A decoder draining into a fixed window is the reading half of the streaming shape, and `drained`
+// is what makes it possible: without it the destination would have to hold the whole answer.
+@test("a drained decoder reads an answer far larger than its window")
+draining_a_small_destination_the_other_way()
+    val src = repetitive(20000)
+    val packed = compress(src, 3).unwrap()
+
+    var d = decoder().unwrap()
+    var window: []u8 = [0; 512]
+    var out: Buf[u8] = buf()
+
+    val whole = packed.view()
+    var at: usize = 0
+    var rounds: usize = 0
+
+    loop
+        rounds += 1
+
+        assert(rounds < 1000, "the decoder stopped making progress; is 'drained' resetting anything?")
+
+        val stop = if at + 300 > whole.len then whole.len else at + 300
+
+        val step = d.push(whole[at..<stop], window, stop < whole.len).unwrap()
+
+        out.extend(window[0..<d.written])
+        d.drained()
+
+        at += step.consumed
+
+        if d.done then break
+
+    same(out.view(), src)
+    assert(out.len() > window.len)
+end draining_a_small_destination_the_other_way
+
+// **`decoder(window)` is the memory bound on reading somebody else's stream**, and a frame asking
+// for more is refused rather than served. That is a different protection from `limit`, which bounds
+// the answer: this one bounds the *decoder*.
+@test("a decoder can refuse a frame whose window is larger than it will hold")
+a_decoder_may_bound_its_window()
+    val src = repetitive(1 << 18)
+
+    // **Streamed and unpledged on purpose**: a one-shot frame declares its content size, and zstd
+    // then writes a window no larger than the content — so the obvious version of this test builds a
+    // frame with a small window and proves nothing. This one asks for a megabyte and means it.
+    val wide = streamed(src, 3, false, 20)
+
+    var narrow = decoder(10).unwrap()
+    var back: []u8 = [0; 1 << 18]
+
+    assert(narrow.push(wide.view(), back, false).is_err(),
+        "a decoder limited to a 1 KB window must refuse a frame wanting a megabyte")
+
+    var roomy = decoder(20).unwrap()
+
+    roomy.push(wide.view(), back, false).unwrap()
+
+    assert(roomy.done)
+    same(back[0..<roomy.written], src)
+
+    assert(decoder(63).is_err(), "and the limit itself is range-checked")
+end a_decoder_may_bound_its_window
+
+// A frame that declares no length is the case where `Short` costs a whole decompression to compute,
+// and it is a different code path from the one above.
+@test("a short slice reports the size even for a frame that declares no length")
+short_without_a_declared_length()
+    val src = repetitive(3000)
+    val packed = streamed(src, 3, false)
+
+    assert_eq(frame_content_size(packed.view()), FrameSize.Unknown)
+
+    var dst: []u8 = [0; 100]
+
+    decompress_into(packed.view(), dst) match
+        Err(Short(needed)) -> assert_eq(needed, src.len)
+        Err(e) -> assert(false, "wanted Short")
+        Ok(m) -> assert(false, "3000 bytes fit in 100")
+end short_without_a_declared_length
+
+// -- Streaming ---------------------------------------------------------------------------------------
+
+// Compress `src` a chunk at a time, which is what everything below is checked against.
+private streamed(src: []const u8, level: int, pledge_size: bool, window: int = 0) -> Buf[u8]
+    var e = encoder(level, false, true, window).unwrap()
+
+    if pledge_size then pledge(e, src.len).unwrap()
+
+    var dst: []u8 = [0; compress_bound(src.len) + 1024]
+
+    var at: usize = 0
+
+    while at < src.len
+        val stop = if at + 97 > src.len then src.len else at + 97
+
+        e.push(src[at..<stop], dst, if stop == src.len then End.Finish else End.Continue).unwrap()
+
+        at = stop
+
+    // An empty input still needs the epilogue asked for.
+    if src.len == 0 then e.push([], dst, End.Finish).unwrap()
+
+    var out: Buf[u8] = buf()
+
+    out.extend(dst[0..<e.written])
+
+    out
+end streamed
+
+@test("an encoder fed in small chunks produces a frame that decompresses to the same bytes")
+streaming_matches_one_shot()
+    val src = repetitive(20000)
+
+    same(decompress(streamed(src, 3, true).view(), 1 << 20).unwrap().view(), src,
+        "chunked compression lost or duplicated something at a boundary")
+
+    // **The bytes need not be the same as the one-shot's** and asserting that they were would be
+    // asserting a choice rather than an answer: an encoder told the input 97 bytes at a time makes
+    // different block decisions from one handed all of it. What must agree is what comes back.
+    val once = compress(src, 3).unwrap()
+
+    same(decompress(once.view(), 1 << 20).unwrap().view(), src)
+end streaming_matches_one_shot
+
+@test("a decoder fed the frame in small chunks reassembles it")
+decoding_in_chunks()
+    val src = repetitive(20000)
+    val packed = compress(src, 3).unwrap()
+
+    var d = decoder().unwrap()
+    var back: []u8 = [0; 20000]
+
+    val whole = packed.view()
+    var at: usize = 0
+
+    while at < whole.len
+        val stop = if at + 61 > whole.len then whole.len else at + 61
+
+        d.push(whole[at..<stop], back, stop < whole.len).unwrap()
+
+        at = stop
+
+    assert(d.done, "the whole frame was offered, so the decoder should have finished")
+    assert_eq(d.written, src.len)
+    same(back[0..<d.written], src)
+end decoding_in_chunks
+
+// An encoder is entitled to hold everything back until it is told to finish, and a caller that
+// treated a zero-byte step as a failure would break on the first chunk.
+//
+// **`done` is `false` for a `Continue` even when nothing is left buffered**, which is the whole
+// reason it is not simply `remaining == 0`: zstd answers zero there routinely, and a caller reading
+// that as a finished frame would stop before the epilogue was written and produce something no
+// decoder accepts.
+@test("an encoder may produce nothing at all until it is finished")
+an_encoder_may_hold_everything_back()
+    var e = encoder(19).unwrap()
+
+    val src = repetitive(4000)
+
+    var dst: []u8 = [0; 8192]
+
+    val first = e.push(src[0..<1000], dst, End.Continue).unwrap()
+
+    assert_eq(first.consumed, 1000)
+    assert(!first.done, "a Continue never finishes a frame, whatever it left buffered")
+
+    val last = e.push(src[1000..], dst, End.Finish).unwrap()
+
+    assert(last.done, "the frame should be closed and flushed")
+    assert_eq(last.remaining, 0)
+    assert(e.written > 0)
+
+    same(decompress(dst[0..<e.written], 1 << 16).unwrap().view(), src)
+end an_encoder_may_hold_everything_back
+
+// **`drained` is what makes the caller-owned destination workable for a socket**, and without it the
+// one slice would have to hold the whole compressed stream. This puts a 20 KB frame through a
+// 512-byte window.
+@test("a drained destination carries a frame far larger than itself")
+draining_a_small_destination()
+    // Noise rather than repeating text, so that the compressed stream is genuinely larger than the
+    // window and the destination really does fill on nearly every push.
+    val src = noise(20000)
+
+    var e = encoder(3).unwrap()
+    var window: []u8 = [0; 512]
+    var out: Buf[u8] = buf()
+
+    var at: usize = 0
+
+    // **The loop needs no inner one**, because a `push` that took only part of its chunk leaves `at`
+    // where it stopped and the next round offers the rest. Once the input is spent, `src[len..<len]`
+    // is empty and the `Finish` is asked for again until the epilogue is out.
+    //
+    // The round counter is a guard rather than decoration: a `drained` that did nothing would leave
+    // the window permanently full, and this loop would spin for ever instead of failing — a hang is
+    // the one test result nobody reads.
+    var rounds: usize = 0
+
+    loop
+        rounds += 1
+
+        assert(rounds < 1000, "the encoder stopped making progress; is 'drained' resetting anything?")
+
+        val stop = if at + 700 > src.len then src.len else at + 700
+        val last = stop == src.len
+
+        val step = e.push(src[at..<stop], window, if last then End.Finish else End.Continue).unwrap()
+
+        out.extend(window[0..<e.written])
+        e.drained()
+
+        at += step.consumed
+
+        if last && at == src.len && step.done then break
+
+    same(decompress(out.view(), 1 << 20).unwrap().view(), src)
+    assert(out.len() > window.len, "the point of this is a stream larger than its window")
+end draining_a_small_destination
+
+// **`Flush` is the difference between a stream and a file**, and the claim is that what has been
+// flushed is readable before the frame ends. Without it a reader waiting on the epilogue waits
+// forever.
+@test("what has been flushed is readable before the frame is finished")
+a_flush_is_readable()
+    var e = encoder(3).unwrap()
+
+    var dst: []u8 = [0; 4096]
+
+    val head = "the first half. ".bytes
+
+    e.push(head, dst, End.Flush).unwrap()
+
+    assert(e.written > 0, "a flush must actually put bytes in the destination")
+
+    var d = decoder().unwrap()
+    var back: []u8 = [0; 256]
+
+    val step = d.push(dst[0..<e.written], back, true).unwrap()
+
+    assert_eq(step.produced, head.len, "everything flushed should be readable")
+    assert(!d.done, "and the frame has not ended")
+    same(back[0..<d.written], head)
+
+    e.push("the second half.".bytes, dst, End.Finish).unwrap()
+
+    same(decompress(dst[0..<e.written], 1 << 16).unwrap().view(),
+        "the first half. the second half.".bytes)
+end a_flush_is_readable
+
+// -- Refusing what is not a whole frame ---------------------------------------------------------------
+
+// A frame cut in half is a different failure from a frame that is wrong, and a caller acts
+// differently on each: one is worth waiting for more bytes, the other is not.
+@test("a truncated frame is Truncated, not Corrupt")
+half_a_frame_is_truncated()
+    val whole = compress(repetitive(4000), 3).unwrap()
+
+    decompress(whole.view()[0..<whole.len() / 2], 1 << 20) match
+        Err(Truncated) -> ()
+        Err(Corrupt(code, why)) -> assert(false, "half a valid frame should read as short")
+        Err(e) -> assert(false, "wanted Truncated")
+        Ok(out) -> assert(false, "half a frame decompressed")
+end half_a_frame_is_truncated
+
+@test("a streaming decoder told there is no more input refuses a truncated frame too")
+truncation_through_the_decoder()
+    val whole = compress(repetitive(4000), 3).unwrap()
+
+    var d = decoder().unwrap()
+    var back: []u8 = [0; 8192]
+
+    d.push(whole.view()[0..<whole.len() / 2], back, false) match
+        Err(Truncated) -> ()
+        Err(e) -> assert(false, "wanted Truncated")
+        Ok(step) -> assert(false, "half a frame satisfied the decoder")
+
+    // The same bytes with `more` set are *not* an error — they are a caller who has not finished.
+    var again = decoder().unwrap()
+
+    val step = again.push(whole.view()[0..<whole.len() / 2], back, true).unwrap()
+
+    assert(!step.done)
+end truncation_through_the_decoder
+
+@test("an empty input is short rather than an empty answer")
+no_input_is_not_an_empty_answer()
+    assert(decompress([], 1 << 16).is_err(),
+        "no bytes at all is not the same as the frame an empty input compresses to")
+
+// **A valid frame with one byte flipped**, rather than invented noise — which is the difference
+// between exercising the decoder's error path and exercising its very first check.
+//
+// The frame carries a checksum, and that is not incidental: **without one, a flipped byte in the
+// literals of a zstd frame decompresses to different bytes and reports nothing**, which is the
+// format working as designed rather than a defect. A caller who needs corruption *found* asks for
+// the checksum, and this test is as much about that as about the error surface.
+@test("a corrupted frame is refused, and zstd's own sentence comes back with the code")
+a_flipped_bit_is_corrupt()
+    val whole = compress(repetitive(4000), 3, true).unwrap()
+
+    var broken: []u8 = [0; whole.len()]
+
+    for i in 0..<whole.len() do broken[i] = whole.at(i)
+
+    // Past the magic number and the frame header, so that this is the compressed content going
+    // wrong rather than the prefix being unrecognisable.
+    broken[whole.len() / 2] = broken[whole.len() / 2] ^ 255
+
+    decompress(broken, 1 << 20) match
+        Err(Corrupt(code, why)) ->
+            assert(code > 0, "zstd's error codes are small positive numbers")
+            assert(why.len > 0, "the sentence zstd prints should reach the caller")
+        Err(Truncated) -> assert(false, "this is corrupt rather than short")
+        Err(e) -> assert(false, "wanted Corrupt")
+        Ok(out) -> assert(false, "a corrupted frame decompressed")
+end a_flipped_bit_is_corrupt
+
+@test("bytes that were never a frame are refused with zstd's unknown-prefix code")
+junk_is_not_a_frame()
+    var junk: []u8 = [7; 64]
+
+    assert(!is_frame(junk))
+
+    decompress(junk, 1 << 16) match
+        Err(Corrupt(code, why)) -> assert(why.len > 0)
+        Err(e) -> assert(false, "wanted Corrupt")
+        Ok(out) -> assert(false, "64 bytes of sevens decompressed")
+end junk_is_not_a_frame
+
+// -- The limit ----------------------------------------------------------------------------------------
+
+@test("a limit smaller than the answer refuses, and names the limit it was given")
+the_limit_refuses()
+    val packed = compress(repetitive(4000), 3).unwrap()
+
+    decompress(packed.view(), 100) match
+        Err(TooLarge(n)) -> assert_eq(n, 100)
+        Err(e) -> assert(false, "wanted TooLarge")
+        Ok(out) -> assert(false, "4000 bytes came back under a 100-byte limit")
+end the_limit_refuses
+
+// **The refusal must happen before the memory is spent, not after** — a limit checked only at the
+// end would pass this. The frame that declares no length is the one that matters, since the other
+// is refused from the header before a byte is produced.
+@test("the limit is checked as output arrives, not once it is all there")
+the_limit_is_not_an_afterthought()
+    val src = repetitive(4000)
+    val declared = compress(src, 3).unwrap()
+    val undeclared = streamed(src, 3, false)
+
+    assert_eq(frame_content_size(undeclared.view()), FrameSize.Unknown)
+
+    assert(decompress(undeclared.view(), 1).is_err())
+    assert(decompress(undeclared.view(), src.len - 1).is_err())
+    assert(decompress(undeclared.view(), src.len).is_ok(),
+        "a limit exactly the size of the answer must be enough")
+
+    assert(decompress(declared.view(), src.len - 1).is_err())
+    assert(decompress(declared.view(), src.len).is_ok())
+end the_limit_is_not_an_afterthought
+
+// -- What a frame says about itself ----------------------------------------------------------------
+
+@test("frame_content_size answers Known, Unknown and NotAFrame as three different things")
+the_three_answers()
+    val src = repetitive(3000)
+
+    assert_eq(frame_content_size(compress(src).unwrap().view()), FrameSize.Known(3000))
+    assert_eq(frame_content_size(streamed(src, 3, false).view()), FrameSize.Unknown)
+
+    var junk: []u8 = [7; 64]
+
+    assert_eq(frame_content_size(junk), FrameSize.NotAFrame)
+    assert_eq(frame_content_size([]), FrameSize.NotAFrame)
+
+    // An empty input makes a valid frame whose content is zero bytes, which is `Known(0)` and not
+    // any of the other two — the distinction the enum exists for.
+    assert_eq(frame_content_size(compress([]).unwrap().view()), FrameSize.Known(0))
+end the_three_answers
+
+// **A pledge is what puts a length in a streamed frame's header**, and without one a reader has to
+// grow. This is the same 3000 bytes coming back `Unknown` and `Known` from the same encoder shape.
+@test("a pledged size reaches the frame header")
+a_pledge_is_written_down()
+    val src = repetitive(3000)
+
+    assert_eq(frame_content_size(streamed(src, 3, true).view()), FrameSize.Known(3000))
+    assert_eq(frame_content_size(streamed(src, 3, false).view()), FrameSize.Unknown)
+
+// **A `Finish` on the very first call overrides the pledge rather than checking it** — zstd's own
+// note 3 says so, because that call delegates to the single-shot path where the real length is
+// known. So the input has to be offered in two steps for the pledge to be a promise at all, and a
+// test written the obvious way passes while proving nothing.
+@test("a pledge the input does not honour is refused rather than written wrong")
+a_broken_pledge_is_refused()
+    var e = encoder(3).unwrap()
+
+    pledge(e, 100).unwrap()
+
+    var dst: []u8 = [0; 4096]
+
+    e.push("0123456789".bytes, dst, End.Continue).unwrap()
+
+    // Ten bytes offered against a pledge of a hundred, and now told to finish.
+    e.push([], dst, End.Finish) match
+        Err(Truncated) -> ()
+        Err(x) -> assert(false, "wanted Truncated for a pledge that was not met")
+        Ok(step) -> assert(false, "zstd accepted a frame ninety bytes short of its pledge")
+
+    // And a pledge that *is* met goes through, so the refusal above is about the promise rather
+    // than about the two-step shape.
+    var kept = encoder(3).unwrap()
+
+    pledge(kept, 10).unwrap()
+
+    kept.push("0123456789".bytes, dst, End.Continue).unwrap()
+
+    assert(kept.push([], dst, End.Finish).unwrap().done)
+end a_broken_pledge_is_refused
+
+@test("is_frame reads the magic number and nothing else")
+is_frame_reads_the_magic()
+    assert(is_frame(compress("x".bytes).unwrap().view()))
+    assert(!is_frame([]))
+    assert(!is_frame([40, 181, 47]), "three bytes cannot carry a four-byte magic")
+    assert(is_frame([40, 181, 47, 253]), "and those four bytes are it, little-endian")
+    assert(!is_frame([40, 181, 47, 252]))
+
+@test("the first frame of a concatenation can be measured")
+frame_compressed_size_walks()
+    val first = compress("hello, ".bytes).unwrap()
+    val second = compress("zstandard".bytes).unwrap()
+
+    var both: Buf[u8] = buf()
+
+    both.extend(first.view())
+    both.extend(second.view())
+
+    assert_eq(frame_compressed_size(both.view()).unwrap(), first.len())
+    assert(frame_compressed_size([7; 64]).is_err())
+end frame_compressed_size_walks
+
+// -- Parameters ---------------------------------------------------------------------------------------
+
+@test("a level outside what this build accepts is refused, and the ends are not")
+a_level_out_of_range_is_refused()
+    compress([104], max_level() + 1) match
+        Err(OutOfRange(what, low, high)) ->
+            assert_eq(what, "level")
+            assert_eq(low, min_level())
+            assert_eq(high, max_level())
+        Err(e) -> assert(false, "wanted OutOfRange")
+        Ok(out) -> assert(false, "a level above the maximum was accepted")
+
+    assert(compress([104], min_level() - 1).is_err())
+
+    assert(compress([104], max_level()).is_ok())
+    assert(compress([104], min_level()).is_ok())
+
+    assert(encoder(max_level() + 1).is_err())
+    assert(encoder(min_level() - 1).is_err())
+end a_level_out_of_range_is_refused
+
+@test("a window outside what zstd accepts is refused, and one inside it round-trips")
+a_window_out_of_range_is_refused()
+    val src = repetitive(20000)
+
+    assert(compress(src, 3, false, 9).is_err(), "9 bits is under zstd's minimum window")
+    assert(compress(src, 3, false, 63).is_err())
+
+    // A 1 KB window on 20 KB of repeating text still works — it just cannot reach as far back.
+    val tiny = compress(src, 3, false, 10).unwrap()
+
+    same(decompress(tiny.view(), 1 << 20).unwrap().view(), src)
+
+    val wide = compress(src, 3, false, 23).unwrap()
+
+    same(decompress(wide.view(), 1 << 20).unwrap().view(), src)
+    assert(wide.len() <= tiny.len(), "a wider window should not compress worse")
+end a_window_out_of_range_is_refused
+
+// **The worker count is the one parameter whose legality depends on how the library was built**, and
+// the bound is asked for rather than assumed. Both branches are real: this asserts whichever one
+// this machine is.
+@test("workers are accepted where the library was built for them and refused where it was not")
+workers_follow_the_build()
+    val src = repetitive(1 << 18)
+
+    if has_multithreading()
+        assert(max_workers() > 0)
+
+        val out = compress(src, 3, false, 0, 2).unwrap()
+
+        same(decompress(out.view(), 1 << 20).unwrap().view(), src)
+
+        // **A multithreaded frame is the same format as a single-threaded one**, so nothing about
+        // the output says whether the workers were asked for. What does say is the context: a
+        // worker pool needs job buffers, and they show up in the footprint.
+        //
+        // **The two-step push is load bearing**: a `Finish` on the first call delegates to zstd's
+        // blocking single-shot path and starts no worker at all, so the obvious version of this
+        // test reports the same footprint both ways and proves nothing. That is also why
+        // `compress` drives a worker-carrying compression in two steps.
+        var alone = encoder(3).unwrap()
+        var crowd = encoder(3, false, true, 0, 2).unwrap()
+
+        var dst: []u8 = [0; compress_bound(src.len)]
+
+        alone.push(src, dst, End.Continue).unwrap()
+        alone.push([], dst, End.Finish).unwrap()
+
+        var other: []u8 = [0; compress_bound(src.len)]
+
+        crowd.push(src, other, End.Continue).unwrap()
+        crowd.push([], other, End.Finish).unwrap()
+
+        assert(crowd.footprint() > alone.footprint(),
+            "two workers should cost more than none, or the parameter never arrived")
+
+        same(decompress(other[0..<crowd.written], 1 << 20).unwrap().view(), src)
+
+        compress(src, 3, false, 0, max_workers() + 1) match
+            Err(OutOfRange(what, low, high)) ->
+                assert_eq(what, "workers")
+                assert_eq(high, max_workers())
+            Err(e) -> assert(false, "wanted OutOfRange")
+            Ok(o) -> assert(false, "more workers than the library allows was accepted")
+    else
+        assert_eq(max_workers(), 0)
+
+        compress(src, 3, false, 0, 1) match
+            Err(OutOfRange(what, low, high)) ->
+                assert_eq(what, "workers")
+                assert_eq(high, 0, "a single-threaded build reports a bound of 0 to 0")
+            Err(e) -> assert(false, "wanted OutOfRange")
+            Ok(o) -> assert(false, "a single-threaded build accepted a worker")
+end workers_follow_the_build
+
+// A checksum is four bytes at the end of the frame and the decoder verifies it. What this pins is
+// that the flag reaches the context at all — a parameter written to the wrong slot would leave the
+// frame the same size.
+@test("a checksum adds four bytes and still round-trips")
+a_checksum_is_written()
+    val src = repetitive(4000)
+
+    val plain = compress(src, 3, false).unwrap()
+    val checked = compress(src, 3, true).unwrap()
+
+    assert_eq(checked.len(), plain.len() + 4)
+
+    same(decompress(checked.view(), 1 << 16).unwrap().view(), src)
+end a_checksum_is_written
+
+// The content-size flag is off by default in a streamed frame and on in a one-shot; turning it off
+// explicitly is what a caller who does not want the length leaked does.
+@test("the content-size flag can be turned off")
+the_content_size_flag_can_be_off()
+    var e = encoder(3, false, false).unwrap()
+
+    pledge(e, 10).unwrap()
+
+    var dst: []u8 = [0; 256]
+
+    e.push("0123456789".bytes, dst, End.Finish).unwrap()
+
+    assert_eq(frame_content_size(dst[0..<e.written]), FrameSize.Unknown,
+        "the size was pledged but the flag said not to write it")
+
+    same(decompress(dst[0..<e.written], 64).unwrap().view(), "0123456789".bytes)
+end the_content_size_flag_can_be_off
+
+// -- Dictionaries --------------------------------------------------------------------------------------
+
+// A corpus of records that look like each other, which is the case a dictionary exists for.
+private corpus() -> []const u8 =
+    ("{\"user\":\"anna\",\"role\":\"editor\",\"active\":true,\"visits\":41}" +
+     "{\"user\":\"bert\",\"role\":\"editor\",\"active\":true,\"visits\":17}" +
+     "{\"user\":\"carl\",\"role\":\"viewer\",\"active\":false,\"visits\":3}").bytes
+
+private record() -> []const u8 = "{\"user\":\"dina\",\"role\":\"viewer\",\"active\":true,\"visits\":92}".bytes
+
+@test("a dictionary round-trips, and earns its keep on a small payload")
+a_dictionary_round_trips()
+    val with_dict = compress_with_dict(record(), corpus()).unwrap()
+    val without = compress(record()).unwrap()
+
+    same(decompress_with_dict(with_dict.view(), corpus(), 1 << 16).unwrap().view(), record())
+
+    assert(with_dict.len() < without.len(),
+        "a 60-byte record against a corpus of records like it should beat compressing it alone")
+end a_dictionary_round_trips
+
+@test("a frame wanting a dictionary is refused without it, and refused with the wrong one")
+the_wrong_dictionary_is_refused()
+    val packed = compress_with_dict(record(), corpus()).unwrap()
+
+    assert(decompress(packed.view(), 1 << 16).is_err(),
+        "a frame naming a dictionary cannot be read without it")
+
+    assert(decompress_with_dict(packed.view(), "an entirely different corpus".bytes, 1 << 16).is_err(),
+        "and not with the wrong one either")
+end the_wrong_dictionary_is_refused
+
+// **A raw corpus carries no dictionary ID, and neither does a frame built against one** — an ID is
+// something `zstd --train` puts in the dictionary's own header, and a lump of representative bytes
+// has no header. So the mismatch above is caught by the *content* failing to decode rather than by
+// an ID comparison, and a caller who wants the ID check has to use a trained dictionary.
+//
+// This is worth a test of its own precisely because it is the opposite of what the API suggests:
+// `frame_dict_id` answering zero does not mean no dictionary was used.
+@test("a raw-content dictionary carries no ID, and a frame built against one names none")
+a_raw_dictionary_has_no_id()
+    assert_eq(dict_id(corpus()), 0, "a lump of representative bytes has no dictionary header")
+
+    val packed = compress_with_dict(record(), corpus()).unwrap()
+
+    assert_eq(frame_dict_id(packed.view()), 0)
+    assert_eq(frame_dict_id(compress(record()).unwrap().view()), 0)
+
+    // The magic a trained dictionary would start with, which the corpus does not.
+    assert(corpus()[0] != 55 || corpus()[1] != 164, "the corpus is not in zstd's dictionary format")
+end a_raw_dictionary_has_no_id
+
+@test("a prepared dictionary answers the same bytes as the raw one")
+prepared_dictionaries()
+    var cd = cdict(corpus(), default_level()).unwrap()
+    var dd = ddict(corpus()).unwrap()
+
+    val prepared = cd.compress(record()).unwrap()
+    val raw = compress_with_dict(record(), corpus()).unwrap()
+
+    assert_eq(prepared.len(), raw.len(),
+        "digesting the dictionary first should change what it costs, not what it produces")
+
+    same(dd.decompress(prepared.view(), 1 << 16).unwrap().view(), record())
+    same(dd.decompress(raw.view(), 1 << 16).unwrap().view(), record())
+
+    assert(cdict(corpus(), max_level() + 1).is_err(), "and the level is still checked")
+end prepared_dictionaries
+
+// -- What is linked ----------------------------------------------------------------------------------
+
+@test("the library reports a version, and it is at least 1.4.0")
+the_version_is_real()
+    assert(version_number() >= 10400, "1.4.0 is where compressStream2 arrived")
+    assert(version().len > 0)
+    assert_eq(version().len >= 5, true, "a version string is at least 'a.b.c'")
+
+@test("the levels are a range and the default is inside it")
+the_levels_are_a_range()
+    assert(min_level() < 0, "zstd's negative levels are a regime of their own")
+    assert(max_level() >= 19)
+    assert(default_level() >= 1)
+    assert(default_level() <= max_level())
+
+// **A context's footprint is measured rather than estimated**, which is the number a server deciding
+// how many encoders it can afford actually needs.
+//
+// It is also **not allocated until the first compression**: a context that has only had its
+// parameters set reports the shell and nothing else, so asking before pushing anything answers the
+// same small number at every level. That is the observation this test exists to pin, since the
+// obvious version of it — construct two encoders and compare — passes for the wrong reason.
+@test("a context reports what it is holding once it has actually compressed something")
+a_context_reports_its_footprint()
+    val src = repetitive(1 << 16)
+
+    var dst: []u8 = [0; compress_bound(src.len)]
+
+    var cheap = encoder(1).unwrap()
+    var dear = encoder(19).unwrap()
+
+    assert_eq(cheap.footprint(), dear.footprint(),
+        "before anything is compressed, a context has allocated nothing to differ about")
+
+    cheap.push(src, dst, End.Finish).unwrap()
+    dear.push(src, dst, End.Finish).unwrap()
+
+    assert(cheap.footprint() > 0)
+    assert(dear.footprint() > cheap.footprint(),
+        "level 19 asks for a far larger window and match table than level 1")
+
+    var d = decoder().unwrap()
+    var back: []u8 = [0; 1 << 16]
+
+    d.push(dst[0..<dear.written], back, false).unwrap()
+
+    assert(d.footprint() > 0)
+    assert(d.footprint() < dear.footprint(),
+        "a decoder needs the window and little else, which is why the two ends are asymmetric")
+end a_context_reports_its_footprint
+
+// Both handles work through the box their constructors return them in.
+//
+// **What this does NOT prove is that the destructors run**, and it is worth saying so out loud: a
+// `Drop` fires when a *box's* count reaches zero and for nothing else, so a constructor handing back
+// a plain value would leak its context and this suite would stay green — the bytes are still right.
+// The check that sees it is a measurement, and `README.md § Checking the contexts are released` has
+// the command and the numbers.
+@test("both handles work through the box their constructors return")
+the_handles_are_boxed()
+    var e: &Encoder = encoder().unwrap()
+    var d: &Decoder = decoder().unwrap()
+
+    var out: []u8 = [0; 128]
+
+    val put = e.push("boxed".bytes, out, End.Finish).unwrap()
+
+    assert(put.done, "the encoder still works through the box")
+
+    var back: []u8 = [0; 128]
+
+    val got = d.push(out[0..<put.produced], back, false).unwrap()
+
+    assert_eq(got.produced, 5, "and so does the decoder")
+end the_handles_are_boxed
+
+// -- Against zstd's own command line -------------------------------------------------------------------
+
+// Where the `zstd` command is, or an empty string where it is not installed.
+private zstd_command() -> string
+    for candidate in ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"]
+        if exists(candidate) then return candidate
+
+    ""
+
+// **This is the corroboration that could actually fail.** It is not a check of the *format* — the
+// command links the same `libzstd` — but of everything this package does around it: the parameters
+// it sets, the cursors it advances, and the frame it claims to have written.
+@test("the zstd command reads what this package writes, and the other way round")
+the_command_line_agrees()
+    val zstd = zstd_command()
+
+    if zstd == ""
+        skip("the zstd command is not installed on this machine")
+
+        return
+
+    val dir = make_temp_dir("sysl-zstd").unwrap()
+
+    val plain = dir + "/plain"
+    val packed = dir + "/packed.zst"
+    val back = dir + "/back"
+
+    val src = repetitive(50000)
+
+    // Ours out, theirs in.
+    write_bytes(plain, compress(src, 9).unwrap().view()).unwrap()
+
+    assert_eq(run(zstd, ["-d", "-q", "-f", "-o", back, plain]).unwrap(), Status.Exited(0),
+        "the zstd command refused a frame this package produced")
+
+    same(read_bytes(back).unwrap(), src, "the command decoded our frame to different bytes")
+
+    // Theirs out, ours in — at three levels, since the level is what changes the frame's shape.
+    for level in ["-1", "-9", "-19"]
+        write_bytes(plain, src).unwrap()
+        remove_file(packed)
+
+        assert_eq(run(zstd, [level, "-q", "-f", "-o", packed, plain]).unwrap(), Status.Exited(0))
+
+        val theirs = read_bytes(packed).unwrap()
+
+        assert(is_frame(theirs))
+        assert_eq(frame_content_size(theirs), FrameSize.Known(src.len))
+
+        same(decompress(theirs, 1 << 20).unwrap().view(), src,
+            "this package decoded the command's frame to different bytes")
+
+    remove_file(plain)
+    remove_file(packed)
+    remove_file(back)
+end the_command_line_agrees
+
+// The command's `-t` verifies a frame's structure and its checksum without writing anything, which
+// is a stronger statement about our output than decompressing it: it says the frame is well formed,
+// not merely that one decoder tolerated it.
+@test("the zstd command verifies a checksummed frame this package wrote")
+the_command_line_verifies_our_checksum()
+    val zstd = zstd_command()
+
+    if zstd == ""
+        skip("the zstd command is not installed on this machine")
+
+        return
+
+    val dir = make_temp_dir("sysl-zstd").unwrap()
+    val packed = dir + "/checked.zst"
+
+    write_bytes(packed, compress(noise(40000), 5, true).unwrap().view()).unwrap()
+
+    assert_eq(run(zstd, ["-t", "-q", packed]).unwrap(), Status.Exited(0),
+        "zstd -t rejected a frame this package wrote with a checksum")
+
+    // And a frame whose content has been altered must not verify, or the check above proves nothing.
+    var broken = read_bytes(packed).unwrap()
+
+    broken[broken.len / 2] = broken[broken.len / 2] ^ 255
+
+    write_bytes(packed, broken).unwrap()
+
+    assert(!run(zstd, ["-t", "-q", packed]).unwrap().ok(),
+        "zstd -t accepted a frame with a flipped byte, so it was not really checking")
+
+    remove_file(packed)
+end the_command_line_verifies_our_checksum

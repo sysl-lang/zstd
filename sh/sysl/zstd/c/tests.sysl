@@ -1,0 +1,111 @@
+// That sysl and clang agree about zstd's memory.
+//
+// **Three structs in this package are sysl declarations laid over storage the library reads and
+// writes**, and a disagreement about any of them links perfectly and corrupts the call at run time.
+// So every field is asserted against the header's own `offsetof` and every struct against its
+// `sizeof` — an upstream that reorders a member then fails a test instead of moving a cursor to the
+// wrong place forever.
+
+module sh.sysl.zstd.c
+@tests
+
+import sysl.harness.*
+import sysl.slices.{as_ptr, as_mut_ptr}
+
+@test("the cursor structs are laid out the way zstd declares them")
+cursors_agree_with_the_header()
+    assert_eq(sizeof(InBuffer), SIZEOF_IN_BUFFER)
+    assert_eq(offsetof(InBuffer, src), OFFSET_IN_SRC)
+    assert_eq(offsetof(InBuffer, size), OFFSET_IN_SIZE)
+    assert_eq(offsetof(InBuffer, pos), OFFSET_IN_POS)
+
+    assert_eq(sizeof(OutBuffer), SIZEOF_OUT_BUFFER)
+    assert_eq(offsetof(OutBuffer, dst), OFFSET_OUT_DST)
+    assert_eq(offsetof(OutBuffer, size), OFFSET_OUT_SIZE)
+    assert_eq(offsetof(OutBuffer, pos), OFFSET_OUT_POS)
+end cursors_agree_with_the_header
+
+// `ZSTD_bounds` is returned **by value** — three words, so on this machine through two registers
+// rather than through `sret`. That a struct crosses by value is settled in the org's own notes; what
+// is not settled anywhere is that *this* struct's fields land where zstd put them.
+@test("the bounds struct comes back by value with its fields where the header has them")
+bounds_agree_with_the_header()
+    assert_eq(sizeof(Bounds), SIZEOF_BOUNDS)
+    assert_eq(offsetof(Bounds, error), OFFSET_BOUNDS_ERROR)
+    assert_eq(offsetof(Bounds, lower), OFFSET_BOUNDS_LOWER)
+    assert_eq(offsetof(Bounds, upper), OFFSET_BOUNDS_UPPER)
+
+    val b = cparam_get_bounds(C_LEVEL)
+
+    assert_eq(is_error(b.error), 0)
+    assert_eq(b.upper, max_clevel())
+    assert_eq(b.lower, min_clevel())
+end bounds_agree_with_the_header
+
+// A `size_t` from this library is a length or an error code, and nothing but `is_error` separates
+// them. A binding that got that wrong would read a compressed length of about 2^64.
+@test("an error result is told from a length by is_error alone")
+errors_are_not_lengths()
+    assert_eq(is_error(0), 0)
+    assert_eq(is_error(100), 0)
+
+    val dx = create_dctx()
+    var dst: [16]u8 = [0; 16]
+
+    // **Two bytes of nonsense is not `prefix_unknown`, it is `srcSize_wrong`** — fewer bytes than a
+    // frame header, so zstd will not say what they are not. The distinction decides what the layer
+    // above answers, since one of those two maps to `Truncated` and the other to `Corrupt`.
+    var stub: [2]u8 = [1, 2]
+
+    val short = decompress_dctx(dx, as_mut_ptr(dst[..]), dst.len, as_ptr(stub[..]), stub.len)
+
+    assert_eq(is_error(short), 1)
+    assert_eq(error_code(short), E_SRC_SIZE_WRONG)
+
+    // Enough bytes to have been a header, and not one.
+    var junk: [24]u8 = [7; 24]
+
+    val bad = decompress_dctx(dx, as_mut_ptr(dst[..]), dst.len, as_ptr(junk[..]), junk.len)
+
+    assert_eq(is_error(bad), 1)
+    assert_eq(error_code(bad), E_PREFIX_UNKNOWN)
+
+    free_dctx(dx)
+end errors_are_not_lengths
+
+// The sentinels are `(0ULL - 1)` and `(0ULL - 2)`, written as arithmetic in the header rather than
+// as literals — so this is as much a check that a `c const` block folds an expression as that the
+// numbers are right.
+@test("the content-size sentinels and the magic number are what the header says")
+sentinels_are_read_from_the_header()
+    assert_eq(CONTENTSIZE_UNKNOWN, 18446744073709551615)
+    assert_eq(CONTENTSIZE_ERROR, 18446744073709551614)
+    assert_eq(MAGICNUMBER, 0xFD2FB528)
+
+@test("the parameter and directive enumerations are read rather than transcribed")
+enumerations_are_read_from_the_header()
+    assert_eq(C_LEVEL, 100)
+    assert_eq(C_WINDOW_LOG, 101)
+    assert_eq(C_CONTENT_SIZE, 200)
+    assert_eq(C_CHECKSUM, 201)
+    assert_eq(C_NB_WORKERS, 400)
+
+    assert_eq(E_CONTINUE, 0)
+    assert_eq(E_FLUSH, 1)
+    assert_eq(E_END, 2)
+
+    assert_eq(RESET_SESSION_ONLY, 1)
+    assert_eq(RESET_SESSION_AND_PARAMETERS, 3)
+end enumerations_are_read_from_the_header
+
+// **`ZSTD_c_nbWorkers`'s upper bound is how a program finds out whether the library it linked was
+// built with multithreading**, and the answer differs between distributions. This asserts the
+// question can be *asked*, not what the answer is — a package that pinned the answer would fail on
+// a machine whose zstd was built the other way.
+@test("the worker bound can be asked for, whatever this build answers")
+the_worker_bound_is_askable()
+    val b = cparam_get_bounds(C_NB_WORKERS)
+
+    assert_eq(is_error(b.error), 0)
+    assert_eq(b.lower, 0)
+    assert(b.upper >= 0, "an upper bound of 0 means a single-threaded build, which is legal")

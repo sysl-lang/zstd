@@ -1,0 +1,54 @@
+// Zstandard for sysl — one-shot and streaming, with dictionaries.
+//
+// This is the block a consumer writes to reach this package:
+//
+//     dependencies {
+//       zstd { git = "github.com/sysl-lang/zstd", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
+// tag `v0.1.0` on this repository.
+//
+// **zstd has to be installed, and so do its headers.** Nothing is vendored: zstd is over a megabyte
+// of C with its own build system, it is not a library anybody would put on a microcontroller, and
+// every platform ships it.
+//
+//     brew install zstd            # macOS
+//     sudo apt install libzstd-dev # Debian / Ubuntu
+//     sudo pacman -S zstd          # Arch
+//
+// **The build needs no flags**, because zstd installs `libzstd.pc` beside itself and the
+// `pkg_config` requirement below asks the machine where it is.
+
+package {
+  name    = "zstd"
+  version = "0.1.0"
+
+  // The compiler this was written against and the only one it is known to build with. Lower it when
+  // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.
+  sysl = "0.0.104"
+}
+
+// **`heap`, and there is no way around it.** Both contexts are allocated by the library, and there
+// is no caller-supplied-slice shape to be had through the stable API: `ZSTD_initStaticCCtx` — the
+// call that would place one in storage a program owns — is behind `ZSTD_STATIC_LINKING_ONLY` and
+// documented as unstable, so a binding using it would be pinned to one build of the library.
+//
+// The sizes are the other half of the answer, and they are measured with a counting allocator rather
+// than estimated. **Every compression is 2 allocations and 2 frees and every decompression is 1 and
+// 1**; what varies is how much: 1.30 MB compressing a megabyte at the default level, 18.1 MB at level
+// 19, and — streaming, with the size not pledged — 3.66 MB at level 3 rising to **874 MB** at level
+// 22. A decompression context is 96 KB whatever the level. There is no figure a caller could size an
+// arena with before choosing all of that, which is why the allocator is not redirected;
+// `Encoder.footprint()` reports the real number afterwards.
+//
+// **No `posix`**: nothing here opens a file, reads a clock or touches a socket. Compression is
+// arithmetic over two buffers. The suite reaches `sysl.process` to cross-check against the `zstd`
+// command line, which costs a consumer nothing — a `@tests` file's needs are not the package's.
+requires {
+  heap = true
+
+  pkg_config {
+    libzstd = "Zstandard — `brew install zstd` on macOS, Debian's libzstd-dev, Arch's zstd"
+  }
+}

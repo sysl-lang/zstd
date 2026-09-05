@@ -1,0 +1,267 @@
+// Zstandard as C declares it: the two contexts, the two prepared dictionaries, the cursor pair the
+// streaming calls advance, and the numbers its header holds.
+//
+// **Nothing is vendored.** zstd is a system library — `libzstd`, installed everywhere as one
+// package — and `package.hocon` asks `pkg-config` where it is. So there is no `defines` block and no
+// build option to get wrong: the objects are the platform's.
+//
+// Nothing here is meant to be called by a program. Every function answers a `size_t` that is either
+// an answer or an error code with the top of the range set, a context is a pointer the library
+// allocated, and a cursor is a struct the caller places and the library writes back into. The module
+// above turns those into `Encoder`, `Decoder` and a `Result`.
+//
+// **Only the stable surface is declared.** Everything guarded by `ZSTDLIB_STATIC_API` in `zstd.h` —
+// `ZSTD_getFrameHeader`, `ZSTD_decompressBound`, the sequence and skippable-frame calls, the
+// `estimate*` family, the static-workspace initialisers — needs `ZSTD_STATIC_LINKING_ONLY` and is
+// documented as unstable, so binding it would pin this package to one build of the library.
+
+module sh.sysl.zstd.c
+
+@include("zstd.h")
+
+// ## The two contexts
+//
+// **Opaque because the library allocates them.** `create` mallocs, `free` releases, and the module
+// above puts that pair behind `Drop`. A `ZSTD_CStream` and a `ZSTD_CCtx` are the same object since
+// v1.3.0, so there is one type here rather than two.
+opaque struct CCtx
+opaque struct DCtx
+
+// A dictionary digested once and used many times. Building one costs roughly what compressing the
+// dictionary costs; referencing it costs nothing.
+opaque struct CDict
+opaque struct DDict
+
+// ## The cursor pair
+//
+// `ZSTD_inBuffer` and `ZSTD_outBuffer` are laid out here as C declares them, and `c/tests.sysl`
+// asserts every field's `offsetof` against the header — so an upstream that reorders one fails a
+// test rather than reading the wrong eight bytes forever.
+//
+// `pos` is what the library writes back: it is where reading or writing stopped, always between
+// zero and `size`.
+struct InBuffer
+    src: *u8
+    size: usize
+    pos: usize
+
+struct OutBuffer
+    dst: *u8
+    size: usize
+    pos: usize
+
+// What `ZSTD_cParam_getBounds` answers: an error status and an inclusive range. **It crosses by
+// value**, which sysl and clang agree about — the assertion is in `c/tests.sysl` rather than left to
+// reading.
+struct Bounds
+    error: usize
+    lower: int
+    upper: int
+
+// ## Errors
+//
+// Every `size_t` this library answers is either a length or an error code near the top of the range,
+// and `is_error` is the only thing that tells them apart. A caller that treats an error as a length
+// gets a buffer size of about 2^64.
+extern "ZSTD_isError" is_error(result: usize) -> u32
+
+// The `ZSTD_ErrorCode` behind a result — a small stable number, listed in `zstd_errors.h`.
+extern "ZSTD_getErrorCode" error_code(result: usize) -> int
+
+// zstd's own sentence for a result, as a static C string the caller does not own.
+extern "ZSTD_getErrorName" error_name(result: usize) -> *u8
+
+// ## What the library is
+extern "ZSTD_versionNumber" version_number() -> u32
+
+extern "ZSTD_versionString" version_string() -> *u8
+
+extern "ZSTD_minCLevel" min_clevel() -> int
+
+extern "ZSTD_maxCLevel" max_clevel() -> int
+
+extern "ZSTD_defaultCLevel" default_clevel() -> int
+
+// ## Sizes
+//
+// The largest a compressed frame can be for an input this long. Incompressible input is larger
+// compressed than raw, because zstd has to frame it.
+extern "ZSTD_compressBound" compress_bound(src_size: usize) -> usize
+
+// What the frame header says the decompressed content is, or one of the two sentinels below. Reads
+// only the header, so a few bytes of a frame are enough.
+extern "ZSTD_getFrameContentSize" frame_content_size(src: *u8, src_size: usize) -> u64
+
+// How long the first frame in `src` is, which is what a reader of a concatenation needs. An error
+// where `src` does not hold a whole frame.
+extern "ZSTD_findFrameCompressedSize" frame_compressed_size(src: *u8, src_size: usize) -> usize
+
+// The buffer sizes zstd would rather be given. They are recommendations and not requirements — any
+// size works — and the output one is guaranteed large enough to flush one complete block.
+extern "ZSTD_CStreamInSize" cstream_in_size() -> usize
+
+extern "ZSTD_CStreamOutSize" cstream_out_size() -> usize
+
+extern "ZSTD_DStreamInSize" dstream_in_size() -> usize
+
+extern "ZSTD_DStreamOutSize" dstream_out_size() -> usize
+
+// ## Compression
+extern "ZSTD_createCCtx" create_cctx() -> *CCtx
+
+extern "ZSTD_freeCCtx" free_cctx(cctx: *CCtx) -> usize
+
+// One frame, with whatever parameters have been pushed into the context. Always blocking, and always
+// starts a new frame.
+extern "ZSTD_compress2" compress2(cctx: *CCtx, dst: *u8, dst_capacity: usize,
+                                  src: *u8, src_size: usize) -> usize
+
+extern "ZSTD_CCtx_setParameter" cctx_set_parameter(cctx: *CCtx, param: int, value: int) -> usize
+
+// What the frame header will claim the content size is. Checked at the end of the frame, so a
+// pledge the input does not honour is an error rather than a silent lie.
+extern "ZSTD_CCtx_setPledgedSrcSize" cctx_set_pledged_src_size(cctx: *CCtx, size: u64) -> usize
+
+extern "ZSTD_CCtx_reset" cctx_reset(cctx: *CCtx, directive: int) -> usize
+
+// The one call that moves a compression along. `output.pos` and `input.pos` are advanced, and the
+// answer is a *hint* — how much is still held internally — rather than a count of anything written.
+extern "ZSTD_compressStream2" compress_stream2(cctx: *CCtx, output: *OutBuffer, input: *InBuffer,
+                                               end_op: int) -> usize
+
+// The inclusive range a parameter accepts on this build of the library. **This is how a program asks
+// whether the installed zstd was compiled with multithreading**: an upper bound of zero on
+// `C_NB_WORKERS` means it was not.
+extern "ZSTD_cParam_getBounds" cparam_get_bounds(param: int) -> Bounds
+
+// ## Decompression
+extern "ZSTD_createDCtx" create_dctx() -> *DCtx
+
+extern "ZSTD_freeDCtx" free_dctx(dctx: *DCtx) -> usize
+
+extern "ZSTD_decompressDCtx" decompress_dctx(dctx: *DCtx, dst: *u8, dst_capacity: usize,
+                                             src: *u8, src_size: usize) -> usize
+
+extern "ZSTD_DCtx_setParameter" dctx_set_parameter(dctx: *DCtx, param: int, value: int) -> usize
+
+extern "ZSTD_DCtx_reset" dctx_reset(dctx: *DCtx, directive: int) -> usize
+
+// Answers zero when a frame is complete, and otherwise a hint at how many more input bytes would
+// help. **That is the whole of truncation detection**: a non-zero answer with no input left is a
+// frame that stopped in the middle.
+extern "ZSTD_decompressStream" decompress_stream(dctx: *DCtx, output: *OutBuffer,
+                                                 input: *InBuffer) -> usize
+
+extern "ZSTD_dParam_getBounds" dparam_get_bounds(param: int) -> Bounds
+
+// ## Dictionaries
+extern "ZSTD_compress_usingDict" compress_using_dict(cctx: *CCtx, dst: *u8, dst_capacity: usize,
+                                                     src: *u8, src_size: usize,
+                                                     dict: *u8, dict_size: usize,
+                                                     level: int) -> usize
+
+extern "ZSTD_decompress_usingDict" decompress_using_dict(dctx: *DCtx, dst: *u8, dst_capacity: usize,
+                                                         src: *u8, src_size: usize,
+                                                         dict: *u8, dict_size: usize) -> usize
+
+// The context copies the dictionary, so the caller's bytes need not outlive this call.
+extern "ZSTD_CCtx_loadDictionary" cctx_load_dictionary(cctx: *CCtx, dict: *u8,
+                                                       dict_size: usize) -> usize
+
+extern "ZSTD_DCtx_loadDictionary" dctx_load_dictionary(dctx: *DCtx, dict: *u8,
+                                                       dict_size: usize) -> usize
+
+extern "ZSTD_createCDict" create_cdict(dict: *u8, dict_size: usize, level: int) -> *CDict
+
+extern "ZSTD_freeCDict" free_cdict(cdict: *CDict) -> usize
+
+extern "ZSTD_createDDict" create_ddict(dict: *u8, dict_size: usize) -> *DDict
+
+extern "ZSTD_freeDDict" free_ddict(ddict: *DDict) -> usize
+
+// **The dictionary must outlive the context that references it**, which is why the layer above holds
+// a share of the box rather than a raw pointer.
+extern "ZSTD_CCtx_refCDict" cctx_ref_cdict(cctx: *CCtx, cdict: *CDict) -> usize
+
+extern "ZSTD_DCtx_refDDict" dctx_ref_ddict(dctx: *DCtx, ddict: *DDict) -> usize
+
+// Zero where the bytes are not a dictionary zstd recognises, or where the dictionary carries no ID.
+extern "ZSTD_getDictID_fromDict" dict_id_from_dict(dict: *u8, dict_size: usize) -> u32
+
+// Zero where the frame was compressed without a dictionary, or without recording which.
+extern "ZSTD_getDictID_fromFrame" dict_id_from_frame(src: *u8, src_size: usize) -> u32
+
+// ## What a context costs
+//
+// The real working set, after the parameters have been applied — which is worth far more than an
+// estimate, and is why this package reports a measured number rather than a guessed one.
+extern "ZSTD_sizeof_CCtx" sizeof_cctx(cctx: *CCtx) -> usize
+
+extern "ZSTD_sizeof_DCtx" sizeof_dctx(dctx: *DCtx) -> usize
+
+// ## The numbers, asked for rather than transcribed
+//
+// **Most of these are `enum` constants rather than `#define`s**, which a `c const` block reads —
+// qrcodegen is the package that first needed that and brotli the second.
+
+// The compression parameters this package sets. The rest of `ZSTD_cParameter` is either an expert
+// knob whose default is right or an experimental one that needs static linking.
+c const
+    C_LEVEL:        int = "ZSTD_c_compressionLevel"
+    C_WINDOW_LOG:   int = "ZSTD_c_windowLog"
+    C_CHECKSUM:     int = "ZSTD_c_checksumFlag"
+    C_CONTENT_SIZE: int = "ZSTD_c_contentSizeFlag"
+    C_DICT_ID:      int = "ZSTD_c_dictIDFlag"
+    C_NB_WORKERS:   int = "ZSTD_c_nbWorkers"
+
+// The decompression parameter worth reaching: the largest window a frame may ask this decoder to
+// hold, which is the memory bound on reading somebody else's stream.
+c const
+    D_WINDOW_LOG_MAX: int = "ZSTD_d_windowLogMax"
+
+// What a step of a compression is being asked to do.
+c const
+    E_CONTINUE: int = "ZSTD_e_continue"
+    E_FLUSH:    int = "ZSTD_e_flush"
+    E_END:      int = "ZSTD_e_end"
+
+c const
+    RESET_SESSION_ONLY:           int = "ZSTD_reset_session_only"
+    RESET_PARAMETERS:             int = "ZSTD_reset_parameters"
+    RESET_SESSION_AND_PARAMETERS: int = "ZSTD_reset_session_and_parameters"
+
+// The two sentinels `frame_content_size` answers instead of a length, and the four bytes a frame
+// starts with.
+c const
+    CONTENTSIZE_UNKNOWN: u64 = "ZSTD_CONTENTSIZE_UNKNOWN"
+    CONTENTSIZE_ERROR:   u64 = "ZSTD_CONTENTSIZE_ERROR"
+    MAGICNUMBER:         u32 = "ZSTD_MAGICNUMBER"
+
+// The error codes this package acts on rather than merely reports. `SRC_SIZE_WRONG` is what the
+// one-shot decompressor says about a frame that stopped early, and `PREFIX_UNKNOWN` is what it says
+// about bytes that were never a frame at all.
+c const
+    E_SRC_SIZE_WRONG:      int = "ZSTD_error_srcSize_wrong"
+    E_PREFIX_UNKNOWN:      int = "ZSTD_error_prefix_unknown"
+    E_MEMORY_ALLOCATION:   int = "ZSTD_error_memory_allocation"
+    E_DST_SIZE_TOO_SMALL:  int = "ZSTD_error_dstSize_tooSmall"
+    E_PARAMETER_OUT_OF_BOUND: int = "ZSTD_error_parameter_outOfBound"
+
+// What the layer above lays over C's storage has to agree with the header, and these are what
+// `c/tests.sysl` checks it against.
+c const
+    SIZEOF_IN_BUFFER:  usize = "sizeof(ZSTD_inBuffer)"
+    SIZEOF_OUT_BUFFER: usize = "sizeof(ZSTD_outBuffer)"
+    SIZEOF_BOUNDS:     usize = "sizeof(ZSTD_bounds)"
+
+    OFFSET_IN_SRC:  usize = "offsetof(ZSTD_inBuffer, src)"
+    OFFSET_IN_SIZE: usize = "offsetof(ZSTD_inBuffer, size)"
+    OFFSET_IN_POS:  usize = "offsetof(ZSTD_inBuffer, pos)"
+
+    OFFSET_OUT_DST:  usize = "offsetof(ZSTD_outBuffer, dst)"
+    OFFSET_OUT_SIZE: usize = "offsetof(ZSTD_outBuffer, size)"
+    OFFSET_OUT_POS:  usize = "offsetof(ZSTD_outBuffer, pos)"
+
+    OFFSET_BOUNDS_ERROR: usize = "offsetof(ZSTD_bounds, error)"
+    OFFSET_BOUNDS_LOWER: usize = "offsetof(ZSTD_bounds, lowerBound)"
+    OFFSET_BOUNDS_UPPER: usize = "offsetof(ZSTD_bounds, upperBound)"
