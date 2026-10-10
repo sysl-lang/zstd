@@ -30,7 +30,7 @@ import sysl.process.{run, Status}
 private repetitive(n: usize) -> []u8
     val line = "the quick brown fox jumps over the lazy dog. ".bytes
 
-    var out: []u8 = [0; n]
+    val out: []u8 = [0; n]
 
     for i in 0..<n do out[i] = line[i % line.len]
 
@@ -40,7 +40,7 @@ private repetitive(n: usize) -> []u8
 // on anybody's random number generator. **This is the input every buffer-sizing mistake shows up
 // on**, because the answer is larger than what went in.
 private noise(n: usize) -> []u8
-    var out: []u8 = [0; n]
+    val out: []u8 = [0; n]
     var x: u32 = 0x2545F491
 
     for i in 0..<n
@@ -63,7 +63,7 @@ private noise(n: usize) -> []u8
 private mixed(n: usize) -> []u8
     val line = "the quick brown fox jumps over the lazy dog. ".bytes
 
-    var out: []u8 = [0; n]
+    val out: []u8 = [0; n]
     var x: u32 = 0x9E3779B9
 
     for i in 0..<n
@@ -184,7 +184,7 @@ bound_is_enough()
 
     val src = noise(4096)
 
-    var dst: []u8 = [0; compress_bound(src.len)]
+    val dst: []u8 = [0; compress_bound(src.len)]
 
     val n = compress_into(src, dst).unwrap()
 
@@ -202,7 +202,7 @@ short_carries_a_size_that_works()
     val src = repetitive(8000)
     val whole = compress(src).unwrap()
 
-    var dst: []u8 = [0; compress_bound(src.len)]
+    val dst: []u8 = [0; compress_bound(src.len)]
 
     // The trap, pinned: a destination the exact size of the answer is refused.
     assert(compress_into(src, dst[0..<whole.len()]).is_err(),
@@ -223,7 +223,7 @@ decompress_into_a_slice()
     val src = repetitive(3000)
     val packed = compress(src).unwrap()
 
-    var dst: []u8 = [0; 4096]
+    val dst: []u8 = [0; 4096]
 
     val n = decompress_into(packed.view(), dst).unwrap()
 
@@ -255,7 +255,7 @@ draining_a_small_destination_the_other_way()
     val packed = compress(src, 3).unwrap()
 
     var d = decoder().unwrap()
-    var window: []u8 = [0; 512]
+    val window: []u8 = [0; 512]
     var out: Buf[u8] = buf()
 
     val whole = packed.view()
@@ -295,7 +295,7 @@ a_decoder_may_bound_its_window()
     val wide = streamed(src, 3, false, 20)
 
     var narrow = decoder(10).unwrap()
-    var back: []u8 = [0; 1 << 18]
+    val back: []u8 =[0; 1 << 18]
 
     assert(narrow.push(wide.view(), back, false).is_err(),
         "a decoder limited to a 1 KB window must refuse a frame wanting a megabyte")
@@ -319,7 +319,7 @@ short_without_a_declared_length()
 
     assert_eq(frame_content_size(packed.view()), FrameSize.Unknown)
 
-    var dst: []u8 = [0; 100]
+    val dst: []u8 = [0; 100]
 
     decompress_into(packed.view(), dst) match
         Err(Short(needed)) -> assert_eq(needed, src.len)
@@ -335,7 +335,7 @@ private streamed(src: []const u8, level: int, pledge_size: bool, window: int = 0
 
     if pledge_size then pledge(e, src.len).unwrap()
 
-    var dst: []u8 = [0; compress_bound(src.len) + 1024]
+    val dst: []u8 = [0; compress_bound(src.len) + 1024]
 
     var at: usize = 0
 
@@ -377,7 +377,7 @@ decoding_in_chunks()
     val packed = compress(src, 3).unwrap()
 
     var d = decoder().unwrap()
-    var back: []u8 = [0; 20000]
+    val back: []u8 =[0; 20000]
 
     val whole = packed.view()
     var at: usize = 0
@@ -407,7 +407,7 @@ an_encoder_may_hold_everything_back()
 
     val src = repetitive(4000)
 
-    var dst: []u8 = [0; 8192]
+    val dst: []u8 = [0; 8192]
 
     val first = e.push(src[0..<1000], dst, End.Continue).unwrap()
 
@@ -433,7 +433,7 @@ draining_a_small_destination()
     val src = noise(20000)
 
     var e = encoder(3).unwrap()
-    var window: []u8 = [0; 512]
+    val window: []u8 = [0; 512]
     var out: Buf[u8] = buf()
 
     var at: usize = 0
@@ -475,7 +475,7 @@ end draining_a_small_destination
 a_flush_is_readable()
     var e = encoder(3).unwrap()
 
-    var dst: []u8 = [0; 4096]
+    val dst: []u8 = [0; 4096]
 
     val head = "the first half. ".bytes
 
@@ -484,7 +484,7 @@ a_flush_is_readable()
     assert(e.written > 0, "a flush must actually put bytes in the destination")
 
     var d = decoder().unwrap()
-    var back: []u8 = [0; 256]
+    val back: []u8 =[0; 256]
 
     val step = d.push(dst[0..<e.written], back, true).unwrap()
 
@@ -518,7 +518,7 @@ truncation_through_the_decoder()
     val whole = compress(repetitive(4000), 3).unwrap()
 
     var d = decoder().unwrap()
-    var back: []u8 = [0; 8192]
+    val back: []u8 =[0; 8192]
 
     d.push(whole.view()[0..<whole.len() / 2], back, false) match
         Err(Truncated) -> ()
@@ -549,7 +549,7 @@ no_input_is_not_an_empty_answer()
 a_flipped_bit_is_corrupt()
     val whole = compress(repetitive(4000), 3, true).unwrap()
 
-    var broken: []u8 = [0; whole.len()]
+    val broken: []u8 =[0; whole.len()]
 
     for i in 0..<whole.len() do broken[i] = whole.at(i)
 
@@ -568,7 +568,7 @@ end a_flipped_bit_is_corrupt
 
 @test("bytes that were never a frame are refused with zstd's unknown-prefix code")
 junk_is_not_a_frame()
-    var junk: []u8 = [7; 64]
+    val junk: []u8 = [7; 64]
 
     assert(!is_frame(junk))
 
@@ -619,7 +619,7 @@ the_three_answers()
     assert_eq(frame_content_size(compress(src).unwrap().view()), FrameSize.Known(3000))
     assert_eq(frame_content_size(streamed(src, 3, false).view()), FrameSize.Unknown)
 
-    var junk: []u8 = [7; 64]
+    val junk: []u8 = [7; 64]
 
     assert_eq(frame_content_size(junk), FrameSize.NotAFrame)
     assert_eq(frame_content_size([]), FrameSize.NotAFrame)
@@ -648,7 +648,7 @@ a_broken_pledge_is_refused()
 
     pledge(e, 100).unwrap()
 
-    var dst: []u8 = [0; 4096]
+    val dst: []u8 = [0; 4096]
 
     e.push("0123456789".bytes, dst, End.Continue).unwrap()
 
@@ -755,12 +755,12 @@ workers_follow_the_build()
         var alone = encoder(3).unwrap()
         var crowd = encoder(3, false, true, 0, 2).unwrap()
 
-        var dst: []u8 = [0; compress_bound(src.len)]
+        val dst: []u8 = [0; compress_bound(src.len)]
 
         alone.push(src, dst, End.Continue).unwrap()
         alone.push([], dst, End.Finish).unwrap()
 
-        var other: []u8 = [0; compress_bound(src.len)]
+        val other: []u8 =[0; compress_bound(src.len)]
 
         crowd.push(src, other, End.Continue).unwrap()
         crowd.push([], other, End.Finish).unwrap()
@@ -810,7 +810,7 @@ the_content_size_flag_can_be_off()
 
     pledge(e, 10).unwrap()
 
-    var dst: []u8 = [0; 256]
+    val dst: []u8 = [0; 256]
 
     e.push("0123456789".bytes, dst, End.Finish).unwrap()
 
@@ -915,7 +915,7 @@ the_levels_are_a_range()
 a_context_reports_its_footprint()
     val src = repetitive(1 << 16)
 
-    var dst: []u8 = [0; compress_bound(src.len)]
+    val dst: []u8 = [0; compress_bound(src.len)]
 
     var cheap = encoder(1).unwrap()
     var dear = encoder(19).unwrap()
@@ -931,7 +931,7 @@ a_context_reports_its_footprint()
         "level 19 asks for a far larger window and match table than level 1")
 
     var d = decoder().unwrap()
-    var back: []u8 = [0; 1 << 16]
+    val back: []u8 =[0; 1 << 16]
 
     d.push(dst[0..<dear.written], back, false).unwrap()
 
@@ -952,13 +952,13 @@ the_handles_are_boxed()
     var e: &Encoder = encoder().unwrap()
     var d: &Decoder = decoder().unwrap()
 
-    var out: []u8 = [0; 128]
+    val out: []u8 = [0; 128]
 
     val put = e.push("boxed".bytes, out, End.Finish).unwrap()
 
     assert(put.done, "the encoder still works through the box")
 
-    var back: []u8 = [0; 128]
+    val back: []u8 =[0; 128]
 
     val got = d.push(out[0..<put.produced], back, false).unwrap()
 

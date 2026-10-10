@@ -3,7 +3,7 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       zstd { git = "github.com/sysl-lang/zstd", version = "0.1.0" }
+//       zstd { git = "github.com/sysl-lang/zstd", version = "0.1.1" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
@@ -22,11 +22,11 @@
 
 package {
   name    = "zstd"
-  version = "0.1.0"
+  version = "0.1.1"
 
   // The compiler this was written against and the only one it is known to build with. Lower it when
   // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.
-  sysl = "0.0.104"
+  sysl = "0.1.0-alpha.8"
 }
 
 // **`heap`, and there is no way around it.** Both contexts are allocated by the library, and there

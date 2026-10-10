@@ -413,7 +413,7 @@ pledge(e: &Encoder, len: usize) -> Result[unit, Error]
 // `compress_into`'s own note.
 compress(src: []const u8, level: int = default_level(), checksum: bool = false,
          window: int = 0, workers: int = 0) -> Result[Buf[u8], Error]
-    var dst: []u8 = [0; c.compress_bound(src.len)]
+    val dst: []u8 = [0; c.compress_bound(src.len)]
 
     val n = compress_into(src, dst, level, checksum, window, workers)?
 
@@ -606,7 +606,7 @@ compress_with_dict(src: []const u8, dict: []const u8,
 
     var e = raw_encoder()?
 
-    var dst: []u8 = [0; c.compress_bound(src.len)]
+    val dst: []u8 = [0; c.compress_bound(src.len)]
 
     val n = c.compress_using_dict(e.cx, as_mut_ptr(dst), dst.len, as_ptr(src), src.len,
                                   as_ptr(dict), dict.len, level)
@@ -652,7 +652,7 @@ struct CDict
 
         if c.is_error(referenced) != 0 then return Err(fault(referenced))
 
-        var dst: []u8 = [0; c.compress_bound(src.len)]
+        val dst: []u8 = [0; c.compress_bound(src.len)]
 
         val n = c.compress2(e.cx, as_mut_ptr(dst), dst.len, as_ptr(src), src.len)
 
@@ -723,7 +723,7 @@ private stream_out(d: &Decoder, src: []const u8, limit: usize) -> Result[Buf[u8]
             buf_with_capacity(n, 0)
         _ -> buf()
 
-    var scratch: []u8 = [0; c.dstream_out_size()]
+    val scratch: []u8 = [0; c.dstream_out_size()]
     var input = c.InBuffer(as_ptr(src), src.len, 0)
 
     loop
