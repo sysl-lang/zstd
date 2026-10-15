@@ -5,6 +5,8 @@ default level zstd is several times faster than zlib and compresses better; at l
 than almost anything that compresses at all; at 19 it is in brotli's range. One library, one format,
 and a level dial running from -131072 to 22 across the whole of that.
 
+*An independent sysl package for Zstandard. It is not affiliated with or endorsed by Zstandard's authors or trademark holders.*
+
 ```
 dependencies {
   zstd { git = "github.com/sysl-lang/zstd", version = "0.1.0" }
