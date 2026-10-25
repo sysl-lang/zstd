@@ -3,11 +3,11 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       zstd { git = "github.com/sysl-lang/zstd", version = "0.1.1" }
+//       zstd { git = "github.com/sysl-lang/zstd", version = "0.1.2" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.1.0` on this repository.
+// tag `v0.1.2` on this repository.
 //
 // **zstd has to be installed, and so do its headers.** Nothing is vendored: zstd is over a megabyte
 // of C with its own build system, it is not a library anybody would put on a microcontroller, and
@@ -22,11 +22,11 @@
 
 package {
   name    = "zstd"
-  version = "0.1.1"
+  version = "0.1.2"
 
   // The compiler this was written against and the only one it is known to build with. Lower it when
   // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.
-  sysl = "0.1.0-alpha.8"
+  sysl = "0.6.0"
 }
 
 // **`heap`, and there is no way around it.** Both contexts are allocated by the library, and there

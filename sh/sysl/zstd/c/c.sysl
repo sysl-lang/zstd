@@ -2,7 +2,7 @@
 // streaming calls advance, and the numbers its header holds.
 //
 // **Nothing is vendored.** zstd is a system library — `libzstd`, installed everywhere as one
-// package — and `package.hocon` asks `pkg-config` where it is. So there is no `defines` block and no
+// package — and `sysl.hocon` asks `pkg-config` where it is. So there is no `defines` block and no
 // build option to get wrong: the objects are the platform's.
 //
 // Nothing here is meant to be called by a program. Every function answers a `size_t` that is either
