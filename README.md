@@ -9,7 +9,7 @@ and a level dial running from -131072 to 22 across the whole of that.
 
 ```
 dependencies {
-  zstd { git = "github.com/sysl-lang/zstd", version = "0.1.0" }
+  zstd { git = "github.com/sysl-lang/zstd", version = "0.1.3" }
 }
 ```
 

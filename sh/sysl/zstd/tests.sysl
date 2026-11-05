@@ -551,7 +551,7 @@ a_flipped_bit_is_corrupt()
 
     val broken: []u8 =[0; whole.len()]
 
-    for i in 0..<whole.len() do broken[i] = whole.at(i)
+    for i in 0..<whole.len() do broken[i] = whole[i]
 
     // Past the magic number and the frame header, so that this is the compressed content going
     // wrong rather than the prefix being unrecognisable.
@@ -1005,7 +1005,7 @@ the_command_line_agrees()
     // Theirs out, ours in — at three levels, since the level is what changes the frame's shape.
     for level in ["-1", "-9", "-19"]
         write_bytes(plain, src).unwrap()
-        remove_file(packed)
+        _ = remove_file(packed)
 
         assert_eq(run(zstd, [level, "-q", "-f", "-o", packed, plain]).unwrap(), Status.Exited(0))
 
@@ -1017,9 +1017,9 @@ the_command_line_agrees()
         same(decompress(theirs, 1 << 20).unwrap().view(), src,
             "this package decoded the command's frame to different bytes")
 
-    remove_file(plain)
-    remove_file(packed)
-    remove_file(back)
+    _ = remove_file(plain)
+    _ = remove_file(packed)
+    _ = remove_file(back)
 end the_command_line_agrees
 
 // The command's `-t` verifies a frame's structure and its checksum without writing anything, which
@@ -1052,5 +1052,5 @@ the_command_line_verifies_our_checksum()
     assert(!run(zstd, ["-t", "-q", packed]).unwrap().ok(),
         "zstd -t accepted a frame with a flipped byte, so it was not really checking")
 
-    remove_file(packed)
+    _ = remove_file(packed)
 end the_command_line_verifies_our_checksum
