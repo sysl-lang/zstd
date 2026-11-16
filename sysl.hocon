@@ -22,7 +22,7 @@
 
 package {
   name    = "zstd"
-  version = "0.1.3"
+  version = "0.1.4"
 
   // The compiler this was written against and the only one it is known to build with. Lower it when
   // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.

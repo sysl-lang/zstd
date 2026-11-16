@@ -20,6 +20,7 @@ module sh.sysl.zstd
 @tests
 
 import sysl.harness.*
+import sysl.testing.skip
 import sysl.buf.{Buf, buf}
 import sysl.fs.{read_bytes, write_bytes, remove_file, exists, make_temp_dir}
 import sysl.process.{run, Status}
